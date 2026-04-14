@@ -1,0 +1,9 @@
+[package]
+name = "large-text-taint"
+version = "0.1.0"
+edition = "2021"
+description = "ARM64 xgtrace taint tracking engine (port of gumtrace C++)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
