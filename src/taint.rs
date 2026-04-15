@@ -1021,10 +1021,10 @@ fn mode_label(mode: TrackMode) -> &'static str {
 }
 
 fn render_chip(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color32) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(bg)
-        .rounding(egui::Rounding::same(4.0))
-        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.add(egui::Label::new(
                 egui::RichText::new(text)
@@ -1044,14 +1044,14 @@ fn render_running_banner(
     status: &str,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(egui::Color32::from_rgb(70, 55, 20))
         .stroke(egui::Stroke::new(
             1.0,
             egui::Color32::from_rgb(255, 210, 100),
         ))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -1091,14 +1091,14 @@ fn render_running_banner(
 /// Red error banner — replaces the rest of the panel content until the next
 /// job runs.
 fn render_error_banner(ui: &mut egui::Ui, message: &str) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(egui::Color32::from_rgb(70, 30, 30))
         .stroke(egui::Stroke::new(
             1.0,
             egui::Color32::from_rgb(240, 120, 120),
         ))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -1192,10 +1192,10 @@ fn render_panel_mini_toolbar(
 fn render_panel_header_summary(ui: &mut egui::Ui, completed: &TaintCompleted) {
     let accent = mode_color(completed.mode);
 
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(ui.visuals().extreme_bg_color)
-        .inner_margin(egui::Margin::symmetric(10.0, 10.0))
-        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(10, 10))
+        .corner_radius(egui::CornerRadius::same(6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, 38.0), egui::Sense::hover());

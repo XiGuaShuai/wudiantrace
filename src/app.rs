@@ -103,6 +103,11 @@ pub struct TextViewerApp {
     /// strings for as long as the search page doesn't change is O(page_size)
     /// once and O(1) per frame.
     search_preview_cache: HashMap<usize, String>,
+    /// Same deal for the "line number" column: `LineIndexer::find_line_at_offset`
+    /// scans up to one checkpoint interval (≤10 MB) in sparse mode, so doing
+    /// it per visible row per frame previously blocked the UI hard enough
+    /// that keystrokes to the Ctrl+F search box stopped registering.
+    search_line_cache: HashMap<usize, usize>,
     /// Identity of the page currently cached — (page_start_index, page_len,
     /// query string). When any of these differ from the live state we rebuild.
     search_preview_cache_key: Option<(usize, usize, String)>,
@@ -171,6 +176,7 @@ impl Default for TextViewerApp {
             show_search_list: true,
             search_list_dock: crate::taint::DockSide::Bottom,
             search_preview_cache: HashMap::new(),
+            search_line_cache: HashMap::new(),
             search_preview_cache_key: None,
         }
     }
@@ -1670,14 +1676,26 @@ impl TextViewerApp {
         if page_or_query_changed {
             self.search_preview_cache.clear();
             self.search_preview_cache.reserve(rows_count);
+            self.search_line_cache.clear();
+            self.search_line_cache.reserve(rows_count);
         }
         if page_or_query_changed
             || self.search_preview_cache.len() < rows_count
         {
+            // Same cache-build pass for both preview strings and line
+            // numbers. Keep them side-by-side so the check at the top of
+            // the frame covers both — otherwise each visible row would
+            // re-run the sparse-index newline scan and block the UI
+            // enough that the Ctrl+F TextEdit drops keystrokes.
             for r in &self.search_results {
                 self.search_preview_cache
                     .entry(r.byte_offset)
                     .or_insert_with(|| preview_for_match(&reader, r));
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.search_line_cache.entry(r.byte_offset)
+                {
+                    e.insert(self.line_indexer.find_line_at_offset(r.byte_offset, &reader));
+                }
             }
             self.search_preview_cache_key =
                 Some((page_start, rows_count, self.search_query.clone()));
@@ -1817,7 +1835,14 @@ impl TextViewerApp {
                             let is_current = global_idx == current_global;
                             row.set_selected(is_current);
 
-                            let viewer_line = self.line_at(result.byte_offset);
+                            // O(1) cached lookup — the per-page cache above
+                            // populated this entry during the frame's build
+                            // pass. Avoids sparse-index scans per row.
+                            let viewer_line = self
+                                .search_line_cache
+                                .get(&result.byte_offset)
+                                .copied()
+                                .unwrap_or(0);
 
                             // O(1) cached lookup (built once per page above).
                             let preview = self

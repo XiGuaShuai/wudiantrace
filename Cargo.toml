@@ -12,9 +12,9 @@ categories = ["gui", "visualization"]
 members = ["crates/large-text-core", "crates/large-text-taint"]
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
-egui_extras = "0.29"
+eframe = "0.31"
+egui = "0.31"
+egui_extras = "0.31"
 notify = "6.1"
 rfd = "0.15"
 anyhow = "1.0"

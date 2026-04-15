@@ -51,7 +51,7 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
-        .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+        .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
     // Put CJK font after the default one for Proportional (keeps egui icons),
     // and append to Monospace as a fallback so Han characters fall back to it.
     fonts
