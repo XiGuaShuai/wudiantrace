@@ -52,7 +52,9 @@ pub enum TaintMessage {
     Error(String),
 }
 
-/// Where to dock the results panel relative to the central text area.
+/// Where a side panel should dock relative to the central text area.
+/// Panels never overlap the editor — the editor always occupies whatever the
+/// docked panels don't.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DockSide {
     Right,
@@ -94,7 +96,7 @@ pub struct TaintState {
     pub filter_dirty: bool,
     pub filtered_indices: Vec<usize>, // indices into completed.hits that match filter
 
-    // Panel docking
+    // Docking side
     pub dock_side: DockSide,
 }
 
@@ -102,7 +104,7 @@ impl Default for TaintState {
     fn default() -> Self {
         Self {
             show_dialog: false,
-            show_panel: false,
+            show_panel: true,
             mode: TrackMode::Backward,
             source_text: String::new(),
             start_line_text: String::new(),
@@ -843,14 +845,12 @@ pub fn render_dialog(
     None
 }
 
-/// Dock the results panel on the selected side. Returns Some(byte_offset) when
-/// the user double-clicks a row — the caller should scroll the central panel
-/// to that byte offset (translate via `LineIndexer::find_line_at_offset`).
+/// Floating results window. Returns Some(byte_offset) when the user
+/// double-clicks a row — the caller should scroll the central panel to that
+/// byte offset (translate via `LineIndexer::find_line_at_offset`).
 pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> {
     let has_error = state.status_text.starts_with("错误");
-    let should_show = state.show_panel
-        && (state.completed.is_some() || state.running || has_error);
-    if !should_show {
+    if !state.show_panel {
         return None;
     }
     let mut clicked_offset: Option<u64> = None;
@@ -864,8 +864,18 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
     }
 
     let mut body = |ui: &mut egui::Ui, state: &mut TaintState| {
-        // Running / error banner at the very top so it always draws, even when
-        // there is no `completed` data yet (first job of the session).
+        // Always-visible mini toolbar (dock switch + close + save when available),
+        // so users can move / hide the panel even before any result exists.
+        render_panel_mini_toolbar(
+            ui,
+            state.completed.is_some(),
+            &mut state.dock_side,
+            &mut save_clicked,
+            &mut close_clicked,
+        );
+        ui.separator();
+
+        // Running / error banner.
         if state.running {
             render_running_banner(ui, &state.status_text, state.cancel.as_ref());
             ui.add_space(4.0);
@@ -875,25 +885,25 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
         }
 
         if state.completed.is_none() {
-            // No results to show yet — just leave the banner above as the
-            // entire panel content.
+            ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("暂无历史结果")
+                egui::RichText::new("暂无污点追踪结果")
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(140, 140, 140))
-                    .italics(),
+                    .color(egui::Color32::from_rgb(180, 180, 180))
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "在主视图右键某条指令,选“向前/向后追踪起点…”,或点菜单 工具 → 污点追踪…",
+                )
+                .size(11.0)
+                .color(egui::Color32::from_rgb(150, 150, 150)),
             );
             return;
         }
 
         let completed = state.completed.as_ref().unwrap();
-        render_panel_header(
-            ui,
-            completed,
-            &mut state.dock_side,
-            &mut save_clicked,
-            &mut close_clicked,
-        );
+        render_panel_header_summary(ui, completed);
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -926,26 +936,29 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
         clicked_offset = render_hits_table(ui, state);
     };
 
+    // Dock as a side panel / bottom panel. The central text area takes
+    // whatever space is left — there is no overlap with the editor.
+    // Each side keeps its own id so widths/heights are remembered per dock.
     match state.dock_side {
         DockSide::Right => {
-            egui::SidePanel::right("taint_panel")
-                .default_width(900.0)
-                .min_width(360.0)
+            egui::SidePanel::right("taint_panel_right")
                 .resizable(true)
+                .default_width(360.0)
+                .min_width(240.0)
                 .show(ctx, |ui| body(ui, state));
         }
         DockSide::Left => {
-            egui::SidePanel::left("taint_panel")
-                .default_width(900.0)
-                .min_width(360.0)
+            egui::SidePanel::left("taint_panel_left")
                 .resizable(true)
+                .default_width(360.0)
+                .min_width(240.0)
                 .show(ctx, |ui| body(ui, state));
         }
         DockSide::Bottom => {
-            egui::TopBottomPanel::bottom("taint_panel")
-                .default_height(320.0)
-                .min_height(140.0)
+            egui::TopBottomPanel::bottom("taint_panel_bottom")
                 .resizable(true)
+                .default_height(180.0)
+                .min_height(100.0)
                 .show(ctx, |ui| body(ui, state));
         }
     }
@@ -1081,23 +1094,88 @@ fn render_error_banner(ui: &mut egui::Ui, message: &str) {
         });
 }
 
-fn render_panel_header(
+/// Always-visible toolbar: section label + dock switch + close + save.
+/// Shown even when there are no results so the user can move / hide the panel
+/// immediately after the app starts.
+fn render_panel_mini_toolbar(
     ui: &mut egui::Ui,
-    completed: &TaintCompleted,
+    has_results: bool,
     dock_side: &mut DockSide,
     save_clicked: &mut bool,
     close_clicked: &mut bool,
 ) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("🎯 污点追踪")
+                .size(13.0)
+                .strong()
+                .color(egui::Color32::from_rgb(255, 210, 100)),
+        );
+
+        ui.separator();
+        if ui
+            .add_enabled(
+                has_results,
+                egui::Button::new(egui::RichText::new("💾 保存").size(12.0)),
+            )
+            .on_hover_text("保存结果到日志文件")
+            .clicked()
+        {
+            *save_clicked = true;
+        }
+
+        ui.separator();
+        ui.label(
+            egui::RichText::new("停靠")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(150, 150, 150)),
+        );
+        let mut dock_btn = |ui: &mut egui::Ui, label: &str, side: DockSide, tip: &str| {
+            let selected = *dock_side == side;
+            let btn = egui::Button::new(
+                egui::RichText::new(label)
+                    .size(14.0)
+                    .color(if selected {
+                        egui::Color32::BLACK
+                    } else {
+                        egui::Color32::from_rgb(210, 210, 210)
+                    }),
+            )
+            .fill(if selected {
+                egui::Color32::from_rgb(255, 210, 100)
+            } else {
+                egui::Color32::TRANSPARENT
+            })
+            .min_size(egui::vec2(26.0, 22.0));
+            if ui.add(btn).on_hover_text(tip).clicked() {
+                *dock_side = side;
+            }
+        };
+        dock_btn(ui, "⬅", DockSide::Left, "停靠到左侧");
+        dock_btn(ui, "⬇", DockSide::Bottom, "停靠到底部");
+        dock_btn(ui, "➡", DockSide::Right, "停靠到右侧");
+
+        ui.separator();
+        if ui
+            .add(egui::Button::new(egui::RichText::new("✖ 关闭").size(12.0)))
+            .on_hover_text("关闭面板(菜单可重新打开)")
+            .clicked()
+        {
+            *close_clicked = true;
+        }
+    });
+}
+
+/// Title + source + stat chips — only drawn when we actually have results.
+fn render_panel_header_summary(ui: &mut egui::Ui, completed: &TaintCompleted) {
     let accent = mode_color(completed.mode);
 
-    // Title bar with colored accent stripe on the left
     egui::Frame::none()
         .fill(ui.visuals().extreme_bg_color)
         .inner_margin(egui::Margin::symmetric(10.0, 10.0))
         .rounding(egui::Rounding::same(6.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Accent bar
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(4.0, 38.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 2.0, accent);
                 ui.add_space(6.0);
@@ -1105,7 +1183,7 @@ fn render_panel_header(
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("污点追踪")
+                            egui::RichText::new("方向")
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(160, 160, 160))
                                 .strong(),
@@ -1136,7 +1214,6 @@ fn render_panel_header(
 
     ui.add_space(6.0);
 
-    // Stat badges row
     ui.horizontal(|ui| {
         render_chip(
             ui,
@@ -1172,57 +1249,7 @@ fn render_panel_header(
         render_chip(ui, stop, bg, fg);
     });
 
-    ui.add_space(6.0);
-
-    // Toolbar
-    ui.horizontal(|ui| {
-        if ui
-            .add(egui::Button::new(egui::RichText::new("💾 保存").size(12.0)))
-            .on_hover_text("保存结果到日志文件")
-            .clicked()
-        {
-            *save_clicked = true;
-        }
-        if ui
-            .add(egui::Button::new(egui::RichText::new("✖ 关闭").size(12.0)))
-            .on_hover_text("关闭面板(结果保留)")
-            .clicked()
-        {
-            *close_clicked = true;
-        }
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(
-            egui::RichText::new("停靠")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(150, 150, 150)),
-        );
-        let mut dock_button = |ui: &mut egui::Ui, label: &str, side: DockSide, tip: &str| {
-            let selected = *dock_side == side;
-            let btn = egui::Button::new(
-                egui::RichText::new(label)
-                    .size(14.0)
-                    .color(if selected {
-                        egui::Color32::BLACK
-                    } else {
-                        egui::Color32::from_rgb(210, 210, 210)
-                    }),
-            )
-            .fill(if selected {
-                egui::Color32::from_rgb(255, 210, 100)
-            } else {
-                egui::Color32::TRANSPARENT
-            })
-            .min_size(egui::vec2(28.0, 22.0));
-            if ui.add(btn).on_hover_text(tip).clicked() {
-                *dock_side = side;
-            }
-        };
-        dock_button(ui, "⬅", DockSide::Left, "停靠到左侧");
-        dock_button(ui, "⬇", DockSide::Bottom, "停靠到底部");
-        dock_button(ui, "➡", DockSide::Right, "停靠到右侧");
-    });
+    ui.add_space(4.0);
 }
 
 fn rebuild_filter(state: &mut TaintState) {

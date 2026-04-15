@@ -93,6 +93,10 @@ pub struct TextViewerApp {
 
     // Taint tracking
     pub(crate) taint: TaintState,
+
+    // Search results list panel (010-Editor-style)
+    show_search_list: bool,
+    search_list_dock: crate::taint::DockSide,
 }
 
 #[derive(Clone)]
@@ -155,6 +159,8 @@ impl Default for TextViewerApp {
             open_start_time: None,
             search_count_start_time: None,
             taint: TaintState::default(),
+            show_search_list: true,
+            search_list_dock: crate::taint::DockSide::Bottom,
         }
     }
 }
@@ -865,6 +871,14 @@ impl TextViewerApp {
                         self.show_replace = !self.show_replace;
                         ui.close_menu();
                     }
+                    if ui
+                        .add(egui::Button::new("搜索结果列表").shortcut_text("Ctrl+L"))
+                        .on_hover_text("在悬浮窗中列出当前页全部匹配,双击跳转")
+                        .clicked()
+                    {
+                        self.show_search_list = !self.show_search_list;
+                        ui.close_menu();
+                    }
                     ui.separator();
                     ui.checkbox(&mut self.use_regex, "Use Regex");
                     ui.checkbox(&mut self.case_sensitive, "Match Case");
@@ -1375,11 +1389,7 @@ impl TextViewerApp {
                                         };
                                     }
 
-                                    ui.add(
-                                        egui::Label::new(job)
-                                            .sense(egui::Sense::click())
-                                            .extend(),
-                                    )
+                                    ui.add(egui::Label::new(job).extend())
                                 } else {
                                     let mut text = egui::RichText::new(line_text)
                                         .monospace()
@@ -1393,17 +1403,9 @@ impl TextViewerApp {
 
                                     // Apply wrap mode
                                     if self.wrap_mode {
-                                        ui.add(
-                                            egui::Label::new(text)
-                                                .sense(egui::Sense::click())
-                                                .wrap(),
-                                        )
+                                        ui.add(egui::Label::new(text).wrap())
                                     } else {
-                                        ui.add(
-                                            egui::Label::new(text)
-                                                .sense(egui::Sense::click())
-                                                .extend(),
-                                        )
+                                        ui.add(egui::Label::new(text).extend())
                                     }
                                 };
 
@@ -1561,6 +1563,289 @@ impl TextViewerApp {
         }
     }
 
+    /// 010-Editor-style floating list of search hits. Shows the matches in
+    /// the current search page with a one-line preview; double-click jumps
+    /// there. Uses the existing paged `search_results` so huge result sets
+    /// remain memory-bounded.
+    fn render_search_list_window(&mut self, ctx: &egui::Context) {
+        if !self.show_search_list {
+            return;
+        }
+        use crate::taint::DockSide;
+        use egui_extras::{Column, TableBuilder};
+
+        let Some(reader) = self.file_reader.clone() else {
+            return;
+        };
+        let total = self.total_search_results;
+        let page_start = self.search_page_start_index;
+        let rows_count = self.search_results.len();
+        let current_global = self.current_result_index;
+
+        let mut jump_global_idx: Option<usize> = None;
+        let mut close_clicked = false;
+        let mut dock_side = self.search_list_dock;
+
+        let body = |ui: &mut egui::Ui| {
+            // Header: title + counts + dock switch + close
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("🔎 搜索结果列表")
+                        .size(13.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 210, 100)),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("停靠")
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(150, 150, 150)),
+                );
+                let mut dock_btn = |ui: &mut egui::Ui, label: &str, side: DockSide, tip: &str| {
+                    let selected = dock_side == side;
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(14.0)
+                            .color(if selected {
+                                egui::Color32::BLACK
+                            } else {
+                                egui::Color32::from_rgb(210, 210, 210)
+                            }),
+                    )
+                    .fill(if selected {
+                        egui::Color32::from_rgb(255, 210, 100)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .min_size(egui::vec2(26.0, 22.0));
+                    if ui.add(btn).on_hover_text(tip).clicked() {
+                        dock_side = side;
+                    }
+                };
+                dock_btn(ui, "⬅", DockSide::Left, "停靠到左侧");
+                dock_btn(ui, "⬇", DockSide::Bottom, "停靠到底部");
+                dock_btn(ui, "➡", DockSide::Right, "停靠到右侧");
+                ui.separator();
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("✖ 关闭").size(12.0)))
+                    .on_hover_text("关闭面板(菜单可重新打开,Ctrl+L)")
+                    .clicked()
+                {
+                    close_clicked = true;
+                }
+            });
+            ui.separator();
+                if total == 0 {
+                    ui.label(
+                        egui::RichText::new("暂无搜索结果,先按 Ctrl+F 搜索一下")
+                            .color(egui::Color32::from_rgb(150, 150, 150))
+                            .italics(),
+                    );
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "当前页 {} 条 · 全局共 {} 条",
+                            rows_count, total
+                        ))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(200, 200, 200)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "显示全局索引 [{}..{})",
+                            page_start,
+                            page_start + rows_count
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(150, 150, 150)),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "提示:双击一行跳转。翻页用搜索工具栏的 ← / → 按钮(每页 1000 条)",
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(150, 150, 150)),
+                );
+                ui.separator();
+
+                let text_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let row_h = text_h + 6.0;
+
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(60.0).at_least(40.0))
+                    .column(Column::initial(90.0).at_least(60.0))
+                    .column(Column::initial(130.0).at_least(80.0))
+                    .column(Column::remainder().at_least(200.0))
+                    .header(22.0, |mut header| {
+                        let hfmt = |s: &str| {
+                            egui::RichText::new(s)
+                                .size(12.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(210, 210, 210))
+                        };
+                        header.col(|ui| {
+                            ui.label(hfmt("#"));
+                        });
+                        header.col(|ui| {
+                            ui.label(hfmt("行号"));
+                        });
+                        header.col(|ui| {
+                            ui.label(hfmt("字节偏移"));
+                        });
+                        header.col(|ui| {
+                            ui.label(hfmt("预览"));
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(row_h, rows_count, |mut row| {
+                            let local_i = row.index();
+                            let result = &self.search_results[local_i];
+                            let global_idx = page_start + local_i;
+                            let is_current = global_idx == current_global;
+                            row.set_selected(is_current);
+
+                            let viewer_line =
+                                self.line_indexer.find_line_at_offset(result.byte_offset);
+
+                            let preview = preview_for_match(&reader, result);
+
+                            let idx_color = if is_current {
+                                egui::Color32::from_rgb(255, 210, 100)
+                            } else {
+                                egui::Color32::from_rgb(180, 180, 180)
+                            };
+                            let line_color = egui::Color32::from_rgb(255, 210, 120);
+                            let off_color = egui::Color32::from_rgb(160, 200, 240);
+                            let prev_color = egui::Color32::from_rgb(225, 225, 225);
+
+                            let mut any_resp: Option<egui::Response> = None;
+                            let merge = |any_resp: &mut Option<egui::Response>,
+                                         r: egui::Response| {
+                                *any_resp = Some(match any_resp.take() {
+                                    Some(prev) => prev.union(r),
+                                    None => r,
+                                });
+                            };
+
+                            row.col(|ui| {
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{}", global_idx + 1))
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(idx_color),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .selectable(false),
+                                );
+                                merge(&mut any_resp, r);
+                            });
+                            row.col(|ui| {
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{}", viewer_line + 1))
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(line_color),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .selectable(false),
+                                );
+                                merge(&mut any_resp, r);
+                            });
+                            row.col(|ui| {
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "0x{:x}",
+                                            result.byte_offset
+                                        ))
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(off_color),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .selectable(false),
+                                );
+                                merge(&mut any_resp, r);
+                            });
+                            row.col(|ui| {
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&preview)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(prev_color),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .selectable(false)
+                                    .truncate(),
+                                )
+                                .on_hover_text(&preview);
+                                merge(&mut any_resp, r);
+                            });
+
+                            if let Some(resp) = any_resp {
+                                if resp.double_clicked() {
+                                    jump_global_idx = Some(global_idx);
+                                }
+                            }
+                        });
+                    });
+        };
+
+        match self.search_list_dock {
+            DockSide::Right => {
+                egui::SidePanel::right("search_list_right")
+                    .resizable(true)
+                    .default_width(360.0)
+                    .min_width(240.0)
+                    .show(ctx, body);
+            }
+            DockSide::Left => {
+                egui::SidePanel::left("search_list_left")
+                    .resizable(true)
+                    .default_width(360.0)
+                    .min_width(240.0)
+                    .show(ctx, body);
+            }
+            DockSide::Bottom => {
+                egui::TopBottomPanel::bottom("search_list_bottom")
+                    .resizable(true)
+                    .default_height(150.0)
+                    .min_height(80.0)
+                    .show(ctx, body);
+            }
+        }
+        self.search_list_dock = dock_side;
+        if close_clicked {
+            self.show_search_list = false;
+        }
+
+        if let Some(global_idx) = jump_global_idx {
+            // Jump only works within the currently loaded page — which is the
+            // only thing the list actually shows anyway.
+            if global_idx >= page_start && global_idx < page_start + rows_count {
+                let local = global_idx - page_start;
+                let result = &self.search_results[local];
+                let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
+                self.current_result_index = global_idx;
+                self.scroll_line = target_line;
+                self.scroll_to_row = Some(target_line);
+                self.pending_scroll_target = Some(target_line);
+            }
+        }
+    }
+
     fn render_file_info(&mut self, ctx: &egui::Context) {
         if self.show_file_info {
             if let Some(ref reader) = self.file_reader {
@@ -1617,6 +1902,9 @@ impl eframe::App for TextViewerApp {
                 self.focus_search_input = true;
             }
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
+            self.show_search_list = !self.show_search_list;
+        }
 
         // Set theme
         if self.dark_mode {
@@ -1644,8 +1932,9 @@ impl eframe::App for TextViewerApp {
         self.render_menu_bar(ctx);
         self.render_toolbar(ctx);
         self.render_status_bar(ctx);
-        // Taint side panel must be drawn before the central text area so the
-        // central panel correctly fills the remaining space.
+        // All dockable SidePanel / TopBottomPanel must be declared BEFORE the
+        // CentralPanel (render_text_area), otherwise egui can't subtract their
+        // space and the bottom panel ends up overlapping the text area.
         if let Some(offset) = crate::taint::render_panel(ctx, &mut self.taint) {
             // Sparse-index row numbers are approximate, but converting an
             // exact byte_offset via `find_line_at_offset` gives the correct
@@ -1654,9 +1943,51 @@ impl eframe::App for TextViewerApp {
             self.scroll_to_row = Some(row);
             self.pending_scroll_target = Some(row);
         }
+        self.render_search_list_window(ctx);
         self.render_text_area(ctx);
         crate::taint::render_dialog(ctx, &mut self.taint, self.file_reader.as_ref());
         self.render_encoding_selector(ctx);
         self.render_file_info(ctx);
     }
+}
+
+/// One-line preview of a match (~32 bytes before, ~128 bytes after, trimmed
+/// to the current line, tabs/whitespace collapsed).
+fn preview_for_match(reader: &FileReader, m: &SearchResult) -> String {
+    const BEFORE: usize = 32;
+    const AFTER: usize = 128;
+    let start = m.byte_offset.saturating_sub(BEFORE);
+    let end = (m.byte_offset + m.match_len + AFTER).min(reader.len());
+    if start >= end {
+        return String::new();
+    }
+    let chunk = reader.get_chunk(start, end);
+    let left = m.byte_offset - start;
+    let split = left.min(chunk.len());
+    let (prefix, suffix) = chunk.split_at(split);
+    let prefix = match prefix.rfind('\n') {
+        Some(p) => &prefix[p + 1..],
+        None => prefix,
+    };
+    let suffix = match suffix.find('\n') {
+        Some(p) => &suffix[..p],
+        None => suffix,
+    };
+    let mut line: String = prefix.to_string();
+    line.push_str(suffix);
+    let mut out = String::with_capacity(line.len());
+    let mut prev_space = false;
+    for c in line.chars() {
+        let c = if c == '\t' { ' ' } else { c };
+        if c == ' ' {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
 }

@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Non-Goals (currently)
+
+**attd** — a trace-log-based replay debugger (time-travel style: pick any instruction as "now", reconstruct registers + memory at that moment, step forward/back, reverse-cause a value). This is the planned next phase but is **explicitly out of scope today**. Do not:
+
+- add stub crates / modules for it (`large-text-replay` etc.)
+- extend `TraceLine` with "replay-friendly" fields that nothing reads
+- introduce "virtual machine state" / "register snapshot" abstractions for future use
+- carve out UI slots (empty panels / menu items) for it
+
+When the user explicitly starts the attd work, add it as a new sibling crate next to `large-text-taint`, consuming the same `Vec<TraceLine>` parser output. Until then, avoid premature abstraction — current code stays lean.
+
 ## Commands
 
 Workspace with three crates: root `large-text-viewer` (GUI binary), `crates/large-text-core` (viewer backend), and `crates/large-text-taint` (ARM64 xgtrace taint tracking, ported from the C++ `gumtrace_src` project).

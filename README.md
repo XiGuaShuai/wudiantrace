@@ -52,6 +52,19 @@ cargo test --workspace
 - [acejarvis/large-text-viewer](https://github.com/acejarvis/large-text-viewer) — 大文件查看器底座(MIT)
 - [lidongyooo/GumTrace](https://github.com/lidongyooo/GumTrace) — ARM64 污点追踪引擎(C++ 原版,本仓库完整 Rust 移植)
 
+## Roadmap(未来规划)
+
+### attd —— 基于 trace log 的回放式调试器(**暂不实现**)
+
+设想中的下一阶段能力(不在当前 scope 内,列在这里只为提醒自己 + 避免别人手滑加代码):
+
+- 以 trace log 的任意一条指令作为"当前时刻",查看那一刻 ARM64 所有寄存器 + 相关内存的重建快照
+- 前进 / 后退单步,跨指令跳转(按地址、按行号、按条件)
+- 反向推因:选一个寄存器/内存值,自动回答"谁在什么时刻把它写成这个值的"(现有的 backward taint 可视为这个能力的前身)
+- 复用现有 `large-text-taint::parser` 产出的 `Vec<TraceLine>`,在上面做虚拟机状态模拟
+
+预计落地方式:新增 `crates/large-text-replay`,与现有 taint 引擎并列,对外再加一个停靠面板。**在用户明确要开始做之前,不加任何 attd 相关的代码或预留接口** —— 避免过早抽象。
+
 ## License
 
 MIT
