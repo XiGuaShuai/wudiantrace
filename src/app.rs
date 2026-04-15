@@ -210,6 +210,27 @@ impl TextViewerApp {
         self.line_indexer.find_line_at_offset(offset, reader)
     }
 
+    /// Programmatic jump that lands `target_row` roughly in the middle of
+    /// the viewport instead of at the top. Used by search-result / taint
+    /// hit jumps so the user gets surrounding context without having to
+    /// scroll up.
+    ///
+    /// Implementation detail: we don't add a new scroll mode — instead we
+    /// subtract half the viewport height from `target_row` up front and
+    /// feed that to the existing top-aligned machinery, including
+    /// `pending_scroll_target` which the correction pass uses to recover
+    /// from f32-precision drift on multi-GB files. `visible_lines` is
+    /// maintained by `render_text_area` each frame (default 50 before the
+    /// first render), so after the first frame it reflects the actual
+    /// viewport size.
+    fn scroll_to_row_centered(&mut self, target_row: usize) {
+        let half = self.visible_lines.saturating_sub(1) / 2;
+        let adjusted = target_row.saturating_sub(half);
+        self.scroll_line = target_row;
+        self.scroll_to_row = Some(adjusted);
+        self.pending_scroll_target = Some(adjusted);
+    }
+
     fn open_file(&mut self, path: PathBuf) {
         self.open_start_time = Some(std::time::Instant::now());
         match FileReader::new(path.clone(), self.selected_encoding) {
@@ -470,8 +491,7 @@ impl TextViewerApp {
                     // Ensure we scroll to the first result if we haven't yet
                     if self.scroll_to_row.is_none() && !self.search_results.is_empty() {
                         let target_line = self.line_at(self.search_results[0].byte_offset);
-                        self.scroll_line = target_line;
-                        self.scroll_to_row = Some(target_line);
+                        self.scroll_to_row_centered(target_line);
                     }
                 } else {
                     self.status_message = "No matches found".to_string();
@@ -489,8 +509,7 @@ impl TextViewerApp {
                     && self.current_result_index == 0
                 {
                     let target_line = self.line_at(self.search_results[0].byte_offset);
-                    self.scroll_line = target_line;
-                    self.scroll_to_row = Some(target_line);
+                    self.scroll_to_row_centered(target_line);
                 }
             }
         }
@@ -700,9 +719,7 @@ impl TextViewerApp {
             let local_index = next_index - self.search_page_start_index;
             let result = &self.search_results[local_index];
             let target_line = self.line_at(result.byte_offset);
-            self.scroll_line = target_line;
-            self.scroll_to_row = Some(target_line);
-            self.pending_scroll_target = Some(target_line);
+            self.scroll_to_row_centered(target_line);
         } else {
             // Need to fetch next page
             // If we are wrapping around to 0
@@ -750,9 +767,7 @@ impl TextViewerApp {
             let local_index = prev_index - self.search_page_start_index;
             let result = &self.search_results[local_index];
             let target_line = self.line_at(result.byte_offset);
-            self.scroll_line = target_line;
-            self.scroll_to_row = Some(target_line);
-            self.pending_scroll_target = Some(target_line);
+            self.scroll_to_row_centered(target_line);
         } else {
             // Need to fetch previous page (or last page if wrapping)
             if prev_index == self.total_search_results - 1 {
@@ -827,10 +842,7 @@ impl TextViewerApp {
         if let Ok(line_num) = self.goto_line_input.parse::<usize>() {
             if line_num > 0 && line_num <= self.line_indexer.total_lines() {
                 let target_line = line_num - 1; // 0-indexed
-                                                // Show a few lines of context above the target line for better orientation
-                self.scroll_line = target_line.saturating_sub(3);
-                self.scroll_to_row = Some(target_line);
-                self.pending_scroll_target = Some(target_line);
+                self.scroll_to_row_centered(target_line);
                 self.status_message = format!("Jumped to line {}", line_num);
             } else {
                 self.status_message = "Line number out of range".to_string();
@@ -1607,8 +1619,23 @@ impl TextViewerApp {
                 }
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("Large Text Viewer");
-                    ui.label("\nClick File → Open to load a text file");
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.label(
+                            egui::RichText::new("西瓜污点分析")
+                                .size(36.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "点击 文件 → 打开,或直接拖入一个文本 / trace 文件",
+                            )
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(200, 200, 200)),
+                        );
+                    });
                 });
             }
         });
@@ -1973,9 +2000,7 @@ impl TextViewerApp {
                 let result = &self.search_results[local];
                 let target_line = self.line_at(result.byte_offset);
                 self.current_result_index = global_idx;
-                self.scroll_line = target_line;
-                self.scroll_to_row = Some(target_line);
-                self.pending_scroll_target = Some(target_line);
+                self.scroll_to_row_centered(target_line);
             }
         }
     }
@@ -2030,9 +2055,9 @@ impl eframe::App for TextViewerApp {
 
         // Update window title
         let title = if self.unsaved_changes {
-            "Large Text Viewer *"
+            "西瓜污点分析 *"
         } else {
-            "Large Text Viewer"
+            "西瓜污点分析"
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
 
@@ -2090,8 +2115,7 @@ impl eframe::App for TextViewerApp {
             // `line_at` resolves exactly even in sparse mode — the panel's
             // line number and the viewer row we scroll to now agree.
             let row = self.line_at(offset as usize);
-            self.scroll_to_row = Some(row);
-            self.pending_scroll_target = Some(row);
+            self.scroll_to_row_centered(row);
         }
         self.render_search_list_window(ctx);
         self.render_text_area(ctx);
