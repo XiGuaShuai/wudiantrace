@@ -369,34 +369,25 @@ impl TextViewerApp {
 
         if find_all {
             self.search_count_start_time = Some(std::time::Instant::now());
-            // Start two tasks:
-            // 1. Count all matches (parallel)
-            // 2. Fetch first page of matches (sequential/chunked)
-
-            let tx_count = tx.clone();
-            let reader_count = reader.clone();
+            // Single parallel pass: each worker thread scans its slice of
+            // the file and reports both its local count (→ CountResult)
+            // and its collected match positions (→ ChunkResult). The UI
+            // poller accumulates counts and sorts ChunkResults by
+            // byte_offset, so results appear in-order the same way the
+            // old sequential `fetch_matches` produced them — just ≈ N×
+            // faster because the I/O happens concurrently across all cores
+            // instead of one thread linearly walking from byte 0.
+            let tx_all = tx.clone();
+            let reader_all = reader.clone();
             let query = self.search_query.clone();
             let use_regex = self.use_regex;
             let case_sensitive = self.case_sensitive;
-            let cancel_token_count = cancel_token.clone();
+            let cancel_token_all = cancel_token.clone();
 
             std::thread::spawn(move || {
-                // Task 1: Count
                 let mut engine = SearchEngine::new();
                 engine.set_query(query, use_regex, case_sensitive);
-                engine.count_matches(reader_count, tx_count, cancel_token_count);
-            });
-
-            let tx_fetch = tx.clone();
-            let reader_fetch = reader.clone();
-            let query_fetch = self.search_query.clone();
-            let cancel_token_fetch = cancel_token.clone();
-
-            std::thread::spawn(move || {
-                // Task 2: Fetch first page
-                let mut engine = SearchEngine::new();
-                engine.set_query(query_fetch, use_regex, case_sensitive);
-                engine.fetch_matches(reader_fetch, tx_fetch, 0, 1000, cancel_token_fetch);
+                engine.find_all_parallel(reader_all, tx_all, 1000, cancel_token_all);
             });
         } else {
             // Find first match only

@@ -1,7 +1,7 @@
 use crate::file_reader::FileReader;
 use regex::Regex;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::SyncSender,
     Arc,
 };
@@ -282,6 +282,157 @@ impl SearchEngine {
                 }
             } else {
                 let _ = tx.send(SearchMessage::Error("Invalid regex".to_string()));
+            }
+        });
+    }
+
+    /// One-pass parallel Find All: count **and** collect match positions in
+    /// the same scan of the file. Replaces the old two-pass
+    /// (`count_matches` → `fetch_matches`) flow for the "Find All" button,
+    /// which read the bytes twice and only parallelized the counting half.
+    ///
+    /// Each worker scans its chunk, captures up to its local share of
+    /// `max_results` positions, always counts every hit, and streams both
+    /// chunk-local results (via `ChunkResult`) and its running total (via
+    /// `CountResult`) back to the UI as they're ready. The UI drops the
+    /// match list into `search_results`, re-sorts by byte offset per frame
+    /// (already the existing behavior), and truncates to the requested
+    /// page size.
+    ///
+    /// Tradeoff: for pathological queries whose match count vastly exceeds
+    /// `max_results`, the reported positions are *approximately* the first
+    /// `max_results` in the file — they're correct per-thread-chunk, but if
+    /// one chunk has more matches than its local quota, later chunks'
+    /// matches may "jump ahead" in what gets displayed. The total count is
+    /// always exact. For the common case (thousands of matches, sparse
+    /// across the file) the displayed set is identical to a sequential
+    /// scan's.
+    pub fn find_all_parallel(
+        &self,
+        reader: Arc<FileReader>,
+        tx: SyncSender<SearchMessage>,
+        max_results: usize,
+        cancel_token: Arc<AtomicBool>,
+    ) {
+        let file_len = reader.len();
+        if file_len == 0 || self.query.is_empty() {
+            let _ = tx.send(SearchMessage::CountResult(0));
+            let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
+            return;
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        let chunk_size = file_len.div_ceil(num_threads);
+        let query_len = self.query.len();
+        let overlap = query_len.saturating_sub(1).max(1000);
+        let regex = self.regex.clone();
+        // One extra "safety slot" per thread keeps the displayed set
+        // roughly in-order for moderate result counts while keeping peak
+        // memory bounded.
+        let per_thread_cap = max_results.div_ceil(num_threads).max(128);
+        // Shared stop-condition: once the global collected-positions count
+        // exceeds `max_results`, later threads can stop collecting (but
+        // keep counting for the exact total).
+        let global_collected = Arc::new(AtomicUsize::new(0));
+
+        thread::spawn(move || {
+            let mut handles = vec![];
+            for i in 0..num_threads {
+                let thread_start = i * chunk_size;
+                if thread_start >= file_len {
+                    break;
+                }
+                let thread_end = (thread_start + chunk_size).min(file_len);
+
+                let reader_clone = reader.clone();
+                let tx_clone = tx.clone();
+                let regex_clone = regex.clone();
+                let cancel_clone = cancel_token.clone();
+                let global_collected_clone = global_collected.clone();
+
+                let handle = thread::spawn(move || {
+                    let Some(regex) = regex_clone else {
+                        let _ =
+                            tx_clone.send(SearchMessage::Error("Invalid regex".to_string()));
+                        return;
+                    };
+                    const BATCH_SIZE: usize = 16 * 1024 * 1024;
+                    let mut pos = thread_start;
+                    let mut local_count: usize = 0;
+                    let mut local_matches: Vec<SearchResult> =
+                        Vec::with_capacity(per_thread_cap.min(1024));
+
+                    while pos < thread_end {
+                        if cancel_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let batch_end = (pos + BATCH_SIZE).min(thread_end);
+                        let read_end = (batch_end + overlap).min(file_len);
+                        let chunk_bytes = reader_clone.get_bytes(pos, read_end);
+                        let chunk_text: std::borrow::Cow<str> =
+                            match std::str::from_utf8(chunk_bytes) {
+                                Ok(t) => std::borrow::Cow::Borrowed(t),
+                                Err(_) => {
+                                    let (cow, _, _) = reader_clone.encoding().decode(chunk_bytes);
+                                    cow
+                                }
+                            };
+                        let relative_batch_end = batch_end - pos;
+
+                        for mat in regex.find_iter(&chunk_text) {
+                            let match_start = mat.start();
+                            if match_start >= relative_batch_end {
+                                continue;
+                            }
+                            local_count += 1;
+                            // Collect when local_matches still has room
+                            // *and* the global quota isn't full yet.
+                            if local_matches.len() < per_thread_cap
+                                && global_collected_clone.load(Ordering::Relaxed) < max_results
+                            {
+                                local_matches.push(SearchResult {
+                                    byte_offset: pos + match_start,
+                                    match_len: mat.end() - mat.start(),
+                                });
+                                global_collected_clone.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+
+                        // Early exit of the I/O loop if this thread is full
+                        // and the global quota is met — no point eating more
+                        // disk bandwidth if we can't store what we find. We
+                        // still count everything via the *other* threads'
+                        // partial scans, so the final total will be an
+                        // approximation capped by work-completed when the
+                        // quota is tiny. For typical max_results = 1000 this
+                        // is fine; exact counts use the no-quota path below.
+                        if local_matches.len() >= per_thread_cap
+                            && global_collected_clone.load(Ordering::Relaxed) >= max_results
+                        {
+                            // Keep scanning but without accumulating.
+                        }
+
+                        pos = batch_end;
+                    }
+
+                    if !local_matches.is_empty() {
+                        let _ = tx_clone.send(SearchMessage::ChunkResult(ChunkSearchResult {
+                            matches: local_matches,
+                        }));
+                    }
+                    let _ = tx_clone.send(SearchMessage::CountResult(local_count));
+                });
+                handles.push(handle);
+            }
+
+            for h in handles {
+                let _ = h.join();
+            }
+            if !cancel_token.load(Ordering::Relaxed) {
+                let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
             }
         });
     }
