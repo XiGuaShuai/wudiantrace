@@ -21,8 +21,14 @@ use large_text_taint::trace::TraceLine;
 /// Hit row info kept for fast highlight lookup + jump.
 #[derive(Clone, Debug)]
 pub struct TaintHit {
-    pub row: usize,           // 0-based line index for viewer scrolling
-    pub line_number: u32,     // 1-based, original
+    /// Byte offset of the start of this line in the mmap. The *authoritative*
+    /// coordinate used for both jump + main-view highlight, because the
+    /// viewer's sparse line index converts byte offsets to rows with enough
+    /// precision for scrolling, while row numbers themselves are only
+    /// approximate in sparse mode.
+    pub file_offset: u64,
+    pub line_number: u32,      // 1-based precise file line (for display)
+    pub raw_line: String,      // full original trace line, shown as tooltip
     pub module_offset: String, // e.g. "libtiny.so!178dc8"
     pub addr: String,          // e.g. "0x76fed9fdc8"
     pub asm: String,           // contents of the double-quoted asm string (tabs normalised to spaces)
@@ -46,6 +52,14 @@ pub enum TaintMessage {
     Error(String),
 }
 
+/// Where to dock the results panel relative to the central text area.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DockSide {
+    Right,
+    Left,
+    Bottom,
+}
+
 pub struct TaintState {
     // Dialog open/close
     pub show_dialog: bool,
@@ -66,13 +80,22 @@ pub struct TaintState {
 
     // Last completed result
     pub completed: Option<TaintCompleted>,
-    pub hit_rows: HashSet<usize>, // for O(1) row lookup during render
+    /// All hit byte offsets (start-of-line) for O(1) highlight lookup during
+    /// main-view rendering. Offsets come straight from parser.file_offset and
+    /// are therefore exact regardless of sparse-index row estimation.
+    pub hit_offsets: HashSet<u64>,
     pub selected_hit: Option<usize>,
+    /// Byte offset of the line the user has selected in the panel. Main view
+    /// uses this to paint the distinct "active" colour.
+    pub selected_offset: Option<u64>,
 
     // Table filter
     pub filter_text: String,
     pub filter_dirty: bool,
     pub filtered_indices: Vec<usize>, // indices into completed.hits that match filter
+
+    // Panel docking
+    pub dock_side: DockSide,
 }
 
 impl Default for TaintState {
@@ -90,11 +113,13 @@ impl Default for TaintState {
             cancel: None,
             rx: None,
             completed: None,
-            hit_rows: HashSet::new(),
+            hit_offsets: HashSet::new(),
             selected_hit: None,
+            selected_offset: None,
             filter_text: String::new(),
             filter_dirty: false,
             filtered_indices: Vec::new(),
+            dock_side: DockSide::Right,
         }
     }
 }
@@ -117,8 +142,9 @@ impl TaintState {
         self.rx = None;
         self.running = false;
         self.completed = None;
-        self.hit_rows.clear();
+        self.hit_offsets.clear();
         self.selected_hit = None;
+        self.selected_offset = None;
         self.filter_text.clear();
         self.filter_dirty = false;
         self.filtered_indices.clear();
@@ -126,36 +152,41 @@ impl TaintState {
     }
 
     /// Kick off a job without going through the dialog — called by the
-    /// right-click quick-start menu. `mode` and `source` are taken directly;
-    /// other options fall back to whatever is currently in the dialog state
-    /// (scan_limit / forward_window_mb).
+    /// right-click quick-start menu. `start_offset` is the exact byte offset
+    /// of the instruction line the user clicked on; `start_line_hint` is the
+    /// viewer-side 1-based line number (shown in status/UI only — sparse-index
+    /// approximations here are harmless because the engine locates the
+    /// instruction by its precise byte offset).
     pub fn quick_start(
         &mut self,
         reader: Arc<FileReader>,
         mode: TrackMode,
         source: TaintSource,
-        start_line: u32,
+        start_offset: u64,
+        start_line_hint: u32,
     ) -> Result<(), String> {
         // sync dialog state so the UI reflects the job parameters
         self.mode = mode;
         self.source_text = format_source_label(&source);
-        self.start_line_text = start_line.to_string();
-        self.start_job_with(reader, mode, source, start_line)
+        self.start_line_text = start_line_hint.to_string();
+        self.start_job_with(reader, mode, source, Some(start_offset), start_line_hint)
     }
 
     /// Kick off a tracking job in a background thread using the dialog inputs.
     pub fn start_job(&mut self, reader: Arc<FileReader>) -> Result<(), String> {
         let source = parse_source(&self.source_text)
-            .map_err(|e| format!("Source target invalid: {}", e))?;
+            .map_err(|e| format!("起点格式无效: {}", e))?;
         let start_line: u32 = self
             .start_line_text
             .trim()
             .parse()
-            .map_err(|_| "Start line must be a positive integer".to_string())?;
+            .map_err(|_| "起始行必须是正整数".to_string())?;
         if start_line == 0 {
-            return Err("Start line must be >= 1".to_string());
+            return Err("起始行必须 >= 1".to_string());
         }
-        self.start_job_with(reader, self.mode, source, start_line)
+        // Dialog entry point: we only have a line number typed by the user,
+        // so we let the backend resolve it via `find_by_line`.
+        self.start_job_with(reader, self.mode, source, None, start_line)
     }
 
     fn start_job_with(
@@ -163,18 +194,19 @@ impl TaintState {
         reader: Arc<FileReader>,
         mode: TrackMode,
         source: TaintSource,
+        start_offset: Option<u64>,
         start_line: u32,
     ) -> Result<(), String> {
         let scan_limit: u32 = self
             .scan_limit_text
             .trim()
             .parse()
-            .map_err(|_| "Scan limit must be a non-negative integer".to_string())?;
+            .map_err(|_| "扫描上限必须是非负整数".to_string())?;
         let window_mb: u64 = self
             .forward_window_mb_text
             .trim()
             .parse()
-            .map_err(|_| "Forward window must be an integer (MB)".to_string())?;
+            .map_err(|_| "向前窗口必须是整数 (MB)".to_string())?;
 
         if let Some(c) = self.cancel.take() {
             c.store(true, Ordering::Relaxed);
@@ -186,24 +218,30 @@ impl TaintState {
         self.cancel = Some(cancel.clone());
         self.rx = Some(rx);
         self.running = true;
+        // Make sure the panel is visible so the user sees the running banner
+        // immediately — otherwise a closed panel + backgrounded job looks
+        // exactly like "clicked, nothing happened".
+        self.show_panel = true;
         self.status_text = format!(
-            "Running {} from line {} ({})",
+            "{} 从行 {} ({}) — 加载 trace 中...",
             match mode {
-                TrackMode::Forward => "forward",
-                TrackMode::Backward => "backward",
+                TrackMode::Forward => "向前",
+                TrackMode::Backward => "向后",
             },
             start_line,
             format_source_label(&source),
         );
-        self.completed = None;
-        self.hit_rows.clear();
-        self.selected_hit = None;
+        // NOTE: keep the previous completed result + highlights visible while
+        // the new job runs. They will be swapped out atomically on the next
+        // `TaintMessage::Done`, so the user never sees a flicker of empty
+        // state on the central text area.
 
         let job = JobConfig {
             reader,
             mode,
             source,
             source_label: format_source_label(&source),
+            start_offset,
             start_line,
             scan_limit,
             forward_window_bytes: window_mb.saturating_mul(1024 * 1024),
@@ -224,22 +262,34 @@ impl TaintState {
                 match msg {
                     TaintMessage::Status(s) => self.status_text = s,
                     TaintMessage::Done(boxed) => {
-                        self.hit_rows = boxed.hits.iter().map(|h| h.row).collect();
+                        // atomic swap: replace highlights + panel data together
+                        self.hit_offsets = boxed.hits.iter().map(|h| h.file_offset).collect();
                         self.status_text = format!(
-                            "Done. {} hits, {} parsed, stop: {}",
+                            "完成。命中 {} 条,已解析 {} 条,停止原因: {}",
                             boxed.hits.len(),
                             boxed.instructions_parsed,
                             stop_reason_label(boxed.stop_reason)
                         );
                         self.filtered_indices = (0..boxed.hits.len()).collect();
                         self.filter_dirty = false;
+                        self.filter_text.clear();
+                        self.selected_hit = None;
+                        self.selected_offset = None;
                         self.completed = Some(*boxed);
                         self.show_panel = true;
                         self.running = false;
                     }
                     TaintMessage::Error(e) => {
-                        self.status_text = format!("Error: {}", e);
+                        // Clear stale result so the panel foregrounds the
+                        // error banner instead of still-showing previous hits.
+                        self.status_text = format!("错误: {}", e);
+                        self.completed = None;
+                        self.hit_offsets.clear();
+                        self.filtered_indices.clear();
+                        self.selected_hit = None;
+                        self.selected_offset = None;
                         self.running = false;
+                        self.show_panel = true;
                     }
                 }
             }
@@ -257,6 +307,10 @@ struct JobConfig {
     mode: TrackMode,
     source: TaintSource,
     source_label: String,
+    /// Exact byte offset of the instruction line to start at. When `Some`,
+    /// it takes priority over `start_line` (used for right-click entries).
+    /// When `None` the backend falls back to `parser.find_by_line(start_line)`.
+    start_offset: Option<u64>,
     start_line: u32,
     scan_limit: u32,
     forward_window_bytes: u64,
@@ -270,6 +324,7 @@ fn run_job(job: JobConfig) {
         mode,
         source,
         source_label,
+        start_offset,
         start_line,
         scan_limit,
         forward_window_bytes,
@@ -278,35 +333,44 @@ fn run_job(job: JobConfig) {
     } = job;
     let bytes = reader.all_data();
 
-    // For backward mode load just [0, start_line]; for forward, count newlines
-    // up to start_line then load [0, that_offset + window].
-    let mut parser = TraceParser::new();
-    match mode {
-        TrackMode::Backward => {
-            let _ = tx.send(TaintMessage::Status(format!(
-                "Parsing trace lines [1..{}] ...",
-                start_line
-            )));
-            parser.load_range(bytes, start_line, u64::MAX);
-        }
-        TrackMode::Forward => {
-            // find byte offset of start_line by counting newlines
+    // Resolve the exact byte offset of the start line. When the caller already
+    // has an offset (right-click path) we trust it; otherwise count newlines
+    // forwards from the start of the file.
+    let start_off = match start_offset {
+        Some(off) => off,
+        None => {
             let _ = tx.send(TaintMessage::Status(
-                "Locating start line in file...".to_string(),
+                "定位起始行...".to_string(),
             ));
-            let start_off = match offset_of_line(bytes, start_line) {
+            match offset_of_line(bytes, start_line) {
                 Some(o) => o,
                 None => {
                     let _ = tx.send(TaintMessage::Error(format!(
-                        "start line {} not found",
+                        "未找到起始行 {}",
                         start_line
                     )));
                     return;
                 }
-            };
+            }
+        }
+    };
+
+    // Load enough of the trace into memory to cover the tracking range.
+    let mut parser = TraceParser::new();
+    match mode {
+        TrackMode::Backward => {
+            let _ = tx.send(TaintMessage::Status(format!(
+                "解析 trace [0..字节 {}] ...",
+                start_off
+            )));
+            // `max_offset = start_off` loads every instruction up to and
+            // including the one whose line starts at `start_off`.
+            parser.load_range(bytes, u32::MAX, start_off);
+        }
+        TrackMode::Forward => {
             let max_off = start_off.saturating_add(forward_window_bytes);
             let _ = tx.send(TaintMessage::Status(format!(
-                "Parsing trace [0..byte {}] (~{} MB) ...",
+                "解析 trace [0..字节 {}] (~{} MB) ...",
                 max_off,
                 max_off / (1024 * 1024)
             )));
@@ -314,21 +378,34 @@ fn run_job(job: JobConfig) {
         }
     }
     if cancel.load(Ordering::Relaxed) {
-        let _ = tx.send(TaintMessage::Error("cancelled".to_string()));
+        let _ = tx.send(TaintMessage::Error("已取消".to_string()));
         return;
     }
     if parser.is_empty() {
         let _ = tx.send(TaintMessage::Error(
-            "no instruction lines found in the parsed range".to_string(),
+            "解析范围内未找到任何指令行".to_string(),
         ));
         return;
     }
 
-    let start_index = match parser.find_by_line(start_line) {
-        Some(i) => i,
+    // Prefer offset-based lookup (exact) over line-number lookup (which is
+    // affected by whether the clicked line is an instruction or a MEM line).
+    let start_index = match parser.find_by_offset(start_off) {
+        Some(i) if parser.lines()[i].file_offset == start_off => i,
+        Some(i) => {
+            // Clicked line itself wasn't an instruction (e.g. a `MEM W` line);
+            // fall through to the nearest following instruction and tell the
+            // user via status so "I clicked 47 but got 48" is not a surprise.
+            let landed = parser.lines()[i].line_number;
+            let _ = tx.send(TaintMessage::Status(format!(
+                "起点第 {} 行不是指令行,已跳到下一条指令(第 {} 行)",
+                start_line, landed
+            )));
+            i
+        }
         None => {
             let _ = tx.send(TaintMessage::Error(format!(
-                "start line {} did not contain a parseable instruction",
+                "起始行 {} 不是可解析的指令行",
                 start_line
             )));
             return;
@@ -336,10 +413,10 @@ fn run_job(job: JobConfig) {
     };
 
     let _ = tx.send(TaintMessage::Status(format!(
-        "Tracking {} from index {} (line {}) ...",
+        "追踪中({})— 起点索引 {} (行 {}) ...",
         match mode {
-            TrackMode::Forward => "forward",
-            TrackMode::Backward => "backward",
+            TrackMode::Forward => "向前",
+            TrackMode::Backward => "向后",
         },
         start_index,
         parser.lines()[start_index].line_number
@@ -353,7 +430,7 @@ fn run_job(job: JobConfig) {
     engine.run(parser.lines(), start_index);
 
     if cancel.load(Ordering::Relaxed) && engine.stop_reason() == StopReason::Cancelled {
-        let _ = tx.send(TaintMessage::Error("cancelled".to_string()));
+        let _ = tx.send(TaintMessage::Error("已取消".to_string()));
         return;
     }
 
@@ -400,10 +477,10 @@ fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit
         tainted_text.push_str(&format!("mem:0x{:x}", m));
     }
 
-    let _ = raw; // consumed into the split fields
     TaintHit {
-        row: tl.line_number.saturating_sub(1) as usize,
+        file_offset: tl.file_offset,
         line_number: tl.line_number,
+        raw_line: raw,
         module_offset,
         addr,
         asm,
@@ -413,10 +490,14 @@ fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit
     }
 }
 
-/// Split an xgtrace instruction line into (`libxxx.so!offset`, `0x<addr>`, `<asm>`).
-/// On malformed input returns the whole string in the module field.
+/// Split an xgtrace line into (module_offset, addr, asm). `asm` is exactly the
+/// string that appeared between the double quotes, with tabs normalised to
+/// single spaces and leading whitespace trimmed — no other formatting applied,
+/// so what you see in the table column matches the disassembler output.
+///
+/// Format:
+///   `libtiny.so!178dc8 0x76fed9fdc8: "\tstp\tx29, x30, [sp, #-0x60]!" FP=..., ...`
 fn split_trace_line(raw: &str) -> (String, String, String) {
-    // Expected shape: `<module>!<offset> 0x<addr>: "<asm>" ...`
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i] != b' ' {
@@ -426,20 +507,15 @@ fn split_trace_line(raw: &str) -> (String, String, String) {
     while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
     }
-    // addr: read until ':' or space
     let addr_start = i;
     while i < bytes.len() && bytes[i] != b':' && bytes[i] != b' ' {
         i += 1;
     }
     let addr = raw[addr_start..i].to_string();
-    // quoted asm
     let asm = if let Some(qs) = raw[i..].find('"') {
         let qs = i + qs + 1;
         if let Some(qe) = raw[qs..].find('"') {
-            let mut s = raw[qs..qs + qe].to_string();
-            // normalise tabs/leading spaces so the column aligns nicely
-            s = s.replace('\t', "  ");
-            s.trim_start().to_string()
+            clean_asm(&raw[qs..qs + qe])
         } else {
             String::new()
         }
@@ -447,6 +523,28 @@ fn split_trace_line(raw: &str) -> (String, String, String) {
         String::new()
     };
     (module_offset, addr, asm)
+}
+
+/// Turn a raw disassembler snippet like `"\tstp\tx29, x30, [sp, #-0x60]!"` into
+/// `"stp x29, x30, [sp, #-0x60]!"` — tabs → single space, then leading
+/// whitespace trimmed. No mnemonic padding: the rendered asm stays as close
+/// as possible to what the original tool emitted.
+fn clean_asm(raw_asm: &str) -> String {
+    let mut s = String::with_capacity(raw_asm.len());
+    let mut last_space = false;
+    for ch in raw_asm.chars() {
+        let c = if ch == '\t' { ' ' } else { ch };
+        if c == ' ' {
+            if !last_space {
+                s.push(' ');
+            }
+            last_space = true;
+        } else {
+            s.push(c);
+            last_space = false;
+        }
+    }
+    s.trim().to_string()
 }
 
 /// Count newlines until reaching the start of `line_number` (1-based).
@@ -513,19 +611,19 @@ pub fn source_display(src: &TaintSource) -> String {
 fn parse_source(s: &str) -> Result<TaintSource, String> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty target".to_string());
+        return Err("起点不能为空".to_string());
     }
     if let Some(rest) = s.strip_prefix("mem:").or_else(|| s.strip_prefix("MEM:")) {
         let hex = rest
             .trim()
             .trim_start_matches("0x")
             .trim_start_matches("0X");
-        let addr = u64::from_str_radix(hex, 16).map_err(|e| format!("bad mem addr: {}", e))?;
+        let addr = u64::from_str_radix(hex, 16).map_err(|e| format!("内存地址格式错误: {}", e))?;
         return Ok(TaintSource::from_mem(addr));
     }
     let id = parse_reg_name(s.as_bytes());
     if id == REG_INVALID {
-        return Err(format!("unknown register '{}'", s));
+        return Err(format!("未知寄存器 '{}'", s));
     }
     Ok(TaintSource::from_reg(id))
 }
@@ -540,10 +638,10 @@ fn format_source_label(src: &TaintSource) -> String {
 
 fn stop_reason_label(r: StopReason) -> &'static str {
     match r {
-        StopReason::AllTaintCleared => "all taint cleared",
-        StopReason::EndOfTrace => "end of trace",
-        StopReason::ScanLimitReached => "scan limit reached",
-        StopReason::Cancelled => "cancelled",
+        StopReason::AllTaintCleared => "污点全部清除",
+        StopReason::EndOfTrace => "到达 trace 末尾",
+        StopReason::ScanLimitReached => "达到扫描上限",
+        StopReason::Cancelled => "已取消",
     }
 }
 
@@ -564,7 +662,7 @@ pub fn render_dialog(
     let mut error: Option<String> = None;
 
     let mut open = state.show_dialog;
-    egui::Window::new(egui::RichText::new("🎯 Taint Tracking").size(14.0))
+    egui::Window::new(egui::RichText::new("🎯 污点追踪").size(14.0))
         .open(&mut open)
         .resizable(false)
         .collapsible(false)
@@ -573,7 +671,7 @@ pub fn render_dialog(
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Direction")
+                egui::RichText::new("方向")
                     .size(11.0)
                     .color(egui::Color32::from_rgb(150, 150, 150)),
             );
@@ -583,7 +681,7 @@ pub fn render_dialog(
                 if ui
                     .add(
                         egui::Button::new(
-                            egui::RichText::new("→  Forward")
+                            egui::RichText::new("→  向前")
                                 .size(13.0)
                                 .color(if fwd_sel {
                                     egui::Color32::BLACK
@@ -605,7 +703,7 @@ pub fn render_dialog(
                 if ui
                     .add(
                         egui::Button::new(
-                            egui::RichText::new("←  Backward")
+                            egui::RichText::new("←  向后")
                                 .size(13.0)
                                 .color(if bwd_sel {
                                     egui::Color32::BLACK
@@ -628,7 +726,7 @@ pub fn render_dialog(
 
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new("Source")
+                egui::RichText::new("起点目标")
                     .size(11.0)
                     .color(egui::Color32::from_rgb(150, 150, 150)),
             );
@@ -640,36 +738,36 @@ pub fn render_dialog(
 
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new("Start line")
+                egui::RichText::new("起始行号")
                     .size(11.0)
                     .color(egui::Color32::from_rgb(150, 150, 150)),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut state.start_line_text)
-                    .hint_text("1-based line number")
+                    .hint_text("从 1 开始计数")
                     .desired_width(f32::INFINITY),
             );
 
             ui.add_space(8.0);
-            ui.collapsing("Advanced options", |ui| {
+            ui.collapsing("高级选项", |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Scan limit:");
+                    ui.label("扫描上限:");
                     ui.add(
                         egui::TextEdit::singleline(&mut state.scan_limit_text)
                             .desired_width(80.0),
                     )
                     .on_hover_text(
-                        "Stop after N consecutive instructions without taint propagation.",
+                        "连续 N 条指令无污点传播则停止",
                     );
                 });
                 if state.mode == TrackMode::Forward {
                     ui.horizontal(|ui| {
-                        ui.label("Forward window (MB):");
+                        ui.label("向前加载窗口 (MB):");
                         ui.add(
                             egui::TextEdit::singleline(&mut state.forward_window_mb_text)
                                 .desired_width(60.0),
                         )
-                        .on_hover_text("Bytes after start line to load for forward mode.");
+                        .on_hover_text("向前模式下从起点往后加载的字节数");
                     });
                 }
             });
@@ -682,7 +780,7 @@ pub fn render_dialog(
                     .add_enabled(
                         can_run,
                         egui::Button::new(
-                            egui::RichText::new("▶  Run")
+                            egui::RichText::new("▶  运行")
                                 .size(13.0)
                                 .color(egui::Color32::BLACK)
                                 .strong(),
@@ -705,7 +803,7 @@ pub fn render_dialog(
                 }
                 if ui
                     .add(
-                        egui::Button::new(egui::RichText::new("Close").size(13.0))
+                        egui::Button::new(egui::RichText::new("关闭").size(13.0))
                             .min_size(egui::vec2(80.0, 28.0)),
                     )
                     .clicked()
@@ -716,7 +814,7 @@ pub fn render_dialog(
                     && ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Cancel running").size(13.0),
+                                egui::RichText::new("取消当前任务").size(13.0),
                             )
                             .min_size(egui::vec2(120.0, 28.0)),
                         )
@@ -725,7 +823,7 @@ pub fn render_dialog(
                     if let Some(c) = &state.cancel {
                         c.store(true, Ordering::Relaxed);
                     }
-                    state.status_text = "Cancel requested...".to_string();
+                    state.status_text = "正在取消...".to_string();
                 }
             });
             if !state.status_text.is_empty() {
@@ -745,13 +843,17 @@ pub fn render_dialog(
     None
 }
 
-/// Right-side dock listing the most recent results. Returns Some(row) when the
-/// user double-clicks a row — the caller should scroll the central panel to it.
-pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<usize> {
-    if !state.show_panel || state.completed.is_none() {
+/// Dock the results panel on the selected side. Returns Some(byte_offset) when
+/// the user double-clicks a row — the caller should scroll the central panel
+/// to that byte offset (translate via `LineIndexer::find_line_at_offset`).
+pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> {
+    let has_error = state.status_text.starts_with("错误");
+    let should_show = state.show_panel
+        && (state.completed.is_some() || state.running || has_error);
+    if !should_show {
         return None;
     }
-    let mut clicked_row = None;
+    let mut clicked_offset: Option<u64> = None;
     let mut save_clicked = false;
     let mut close_clicked = false;
 
@@ -761,50 +863,93 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<usize
         state.filter_dirty = false;
     }
 
-    egui::SidePanel::right("taint_panel")
-        .default_width(900.0)
-        .min_width(500.0)
-        .resizable(true)
-        .show(ctx, |ui| {
-            let completed = state.completed.as_ref().unwrap();
-            render_panel_header(
-                ui,
-                completed,
-                &mut save_clicked,
-                &mut close_clicked,
-            );
-
-            // Filter box (like taint_gui.py)
+    let mut body = |ui: &mut egui::Ui, state: &mut TaintState| {
+        // Running / error banner at the very top so it always draws, even when
+        // there is no `completed` data yet (first job of the session).
+        if state.running {
+            render_running_banner(ui, &state.status_text, state.cancel.as_ref());
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("filter")
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(150, 150, 150)),
-                );
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut state.filter_text)
-                        .hint_text("substring, any column (e.g. ldr / mem:0xac2 / x8)")
-                        .desired_width(f32::INFINITY),
-                );
-                if resp.changed() {
-                    state.filter_dirty = true;
-                }
-            });
-            let shown = state.filtered_indices.len();
-            let total = completed.hits.len();
+        } else if has_error {
+            render_error_banner(ui, &state.status_text);
+            ui.add_space(4.0);
+        }
+
+        if state.completed.is_none() {
+            // No results to show yet — just leave the banner above as the
+            // entire panel content.
             ui.label(
-                egui::RichText::new(format!(
-                    "showing {} of {} — double-click a row to jump",
-                    shown, total
-                ))
-                .size(11.0)
-                .color(egui::Color32::from_rgb(160, 160, 160)),
+                egui::RichText::new("暂无历史结果")
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(140, 140, 140))
+                    .italics(),
             );
-            ui.add_space(4.0);
+            return;
+        }
 
-            clicked_row = render_hits_table(ui, state);
+        let completed = state.completed.as_ref().unwrap();
+        render_panel_header(
+            ui,
+            completed,
+            &mut state.dock_side,
+            &mut save_clicked,
+            &mut close_clicked,
+        );
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("过滤")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(150, 150, 150)),
+            );
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut state.filter_text)
+                    .hint_text("子串匹配,任意列(例: ldr / mem:0xac2 / x8)")
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.changed() {
+                state.filter_dirty = true;
+            }
         });
+        let shown = state.filtered_indices.len();
+        let total = state.completed.as_ref().unwrap().hits.len();
+        ui.label(
+            egui::RichText::new(format!(
+                "显示 {} / {} 条 — 双击跳转到对应 trace 行",
+                shown, total
+            ))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(160, 160, 160)),
+        );
+        ui.add_space(4.0);
+
+        clicked_offset = render_hits_table(ui, state);
+    };
+
+    match state.dock_side {
+        DockSide::Right => {
+            egui::SidePanel::right("taint_panel")
+                .default_width(900.0)
+                .min_width(360.0)
+                .resizable(true)
+                .show(ctx, |ui| body(ui, state));
+        }
+        DockSide::Left => {
+            egui::SidePanel::left("taint_panel")
+                .default_width(900.0)
+                .min_width(360.0)
+                .resizable(true)
+                .show(ctx, |ui| body(ui, state));
+        }
+        DockSide::Bottom => {
+            egui::TopBottomPanel::bottom("taint_panel")
+                .default_height(320.0)
+                .min_height(140.0)
+                .resizable(true)
+                .show(ctx, |ui| body(ui, state));
+        }
+    }
+
     if save_clicked {
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name("taint_result.log")
@@ -816,7 +961,7 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<usize
     if close_clicked {
         state.show_panel = false;
     }
-    clicked_row
+    clicked_offset
 }
 
 // =========================================================================
@@ -835,8 +980,8 @@ fn mode_color(mode: TrackMode) -> egui::Color32 {
 
 fn mode_label(mode: TrackMode) -> &'static str {
     match mode {
-        TrackMode::Forward => "FORWARD",
-        TrackMode::Backward => "BACKWARD",
+        TrackMode::Forward => "向前",
+        TrackMode::Backward => "向后",
     }
 }
 
@@ -855,9 +1000,91 @@ fn render_chip(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color
         });
 }
 
+/// Visible "🔄 running" banner painted at the top of the panel. Shows a
+/// spinner + current status text + a Cancel button so the user always knows
+/// a taint job is in flight, even when the previous result is still shown
+/// below.
+fn render_running_banner(
+    ui: &mut egui::Ui,
+    status: &str,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(70, 55, 20))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(255, 210, 100),
+        ))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("污点分析进行中")
+                        .size(12.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 230, 150)),
+                );
+                if !status.is_empty() {
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(220, 220, 200)),
+                    );
+                }
+                if let Some(c) = cancel {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("取消")
+                                    .size(11.0)
+                                    .color(egui::Color32::BLACK),
+                            )
+                            .fill(egui::Color32::from_rgb(255, 210, 100))
+                            .min_size(egui::vec2(60.0, 22.0)),
+                        )
+                        .clicked()
+                    {
+                        c.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        });
+}
+
+/// Red error banner — replaces the rest of the panel content until the next
+/// job runs.
+fn render_error_banner(ui: &mut egui::Ui, message: &str) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(70, 30, 30))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(240, 120, 120),
+        ))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("⚠")
+                        .size(16.0)
+                        .color(egui::Color32::from_rgb(255, 180, 180)),
+                );
+                ui.label(
+                    egui::RichText::new(message)
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(255, 200, 200))
+                        .strong(),
+                );
+            });
+        });
+}
+
 fn render_panel_header(
     ui: &mut egui::Ui,
     completed: &TaintCompleted,
+    dock_side: &mut DockSide,
     save_clicked: &mut bool,
     close_clicked: &mut bool,
 ) {
@@ -878,7 +1105,7 @@ fn render_panel_header(
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("TAINT")
+                            egui::RichText::new("污点追踪")
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(160, 160, 160))
                                 .strong(),
@@ -892,7 +1119,7 @@ fn render_panel_header(
                     });
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("source:")
+                            egui::RichText::new("起点:")
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(140, 140, 140)),
                         );
@@ -913,13 +1140,13 @@ fn render_panel_header(
     ui.horizontal(|ui| {
         render_chip(
             ui,
-            &format!("{} hits", completed.hits.len()),
+            &format!("命中 {} 条", completed.hits.len()),
             egui::Color32::from_rgb(40, 60, 40),
             egui::Color32::from_rgb(180, 240, 180),
         );
         render_chip(
             ui,
-            &format!("{} parsed", completed.instructions_parsed),
+            &format!("已解析 {} 条", completed.instructions_parsed),
             egui::Color32::from_rgb(40, 50, 60),
             egui::Color32::from_rgb(180, 210, 240),
         );
@@ -950,19 +1177,51 @@ fn render_panel_header(
     // Toolbar
     ui.horizontal(|ui| {
         if ui
-            .add(egui::Button::new(egui::RichText::new("💾 Save").size(12.0)))
-            .on_hover_text("Save results to a log file")
+            .add(egui::Button::new(egui::RichText::new("💾 保存").size(12.0)))
+            .on_hover_text("保存结果到日志文件")
             .clicked()
         {
             *save_clicked = true;
         }
         if ui
-            .add(egui::Button::new(egui::RichText::new("✖ Close").size(12.0)))
-            .on_hover_text("Close this panel (results are kept)")
+            .add(egui::Button::new(egui::RichText::new("✖ 关闭").size(12.0)))
+            .on_hover_text("关闭面板(结果保留)")
             .clicked()
         {
             *close_clicked = true;
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new("停靠")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(150, 150, 150)),
+        );
+        let mut dock_button = |ui: &mut egui::Ui, label: &str, side: DockSide, tip: &str| {
+            let selected = *dock_side == side;
+            let btn = egui::Button::new(
+                egui::RichText::new(label)
+                    .size(14.0)
+                    .color(if selected {
+                        egui::Color32::BLACK
+                    } else {
+                        egui::Color32::from_rgb(210, 210, 210)
+                    }),
+            )
+            .fill(if selected {
+                egui::Color32::from_rgb(255, 210, 100)
+            } else {
+                egui::Color32::TRANSPARENT
+            })
+            .min_size(egui::vec2(28.0, 22.0));
+            if ui.add(btn).on_hover_text(tip).clicked() {
+                *dock_side = side;
+            }
+        };
+        dock_button(ui, "⬅", DockSide::Left, "停靠到左侧");
+        dock_button(ui, "⬇", DockSide::Bottom, "停靠到底部");
+        dock_button(ui, "➡", DockSide::Right, "停靠到右侧");
     });
 }
 
@@ -981,6 +1240,7 @@ fn rebuild_filter(state: &mut TaintState) {
                 if h.module_offset.to_lowercase().contains(&q)
                     || h.addr.to_lowercase().contains(&q)
                     || h.asm.to_lowercase().contains(&q)
+                    || h.raw_line.to_lowercase().contains(&q)
                     || h.tainted_text.to_lowercase().contains(&q)
                     || h.line_number.to_string().contains(&q)
                 {
@@ -995,10 +1255,10 @@ fn rebuild_filter(state: &mut TaintState) {
 
 /// Table view — five columns like taint_gui.py (Line / Module!Offset / Addr /
 /// ASM / Tainted). Double-click a row to jump. Returns the target row on jump.
-fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<usize> {
+fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
     use egui_extras::{Column, TableBuilder};
 
-    let mut jump_to: Option<usize> = None;
+    let mut jump_to: Option<u64> = None;
     let text_h = ui.text_style_height(&egui::TextStyle::Monospace);
     let row_h = text_h + 6.0;
 
@@ -1017,7 +1277,7 @@ fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<usize>
         .column(Column::initial(70.0).at_least(50.0))
         .column(Column::initial(170.0).at_least(80.0))
         .column(Column::initial(130.0).at_least(80.0))
-        .column(Column::initial(360.0).at_least(150.0))
+        .column(Column::initial(460.0).at_least(180.0))
         .column(Column::remainder().at_least(120.0))
         .header(22.0, |mut header| {
             let hfmt = |s: &str| {
@@ -1027,19 +1287,19 @@ fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<usize>
                     .color(egui::Color32::from_rgb(210, 210, 210))
             };
             header.col(|ui| {
-                ui.label(hfmt("Line"));
+                ui.label(hfmt("行号"));
             });
             header.col(|ui| {
-                ui.label(hfmt("Module!Offset"));
+                ui.label(hfmt("模块!偏移"));
             });
             header.col(|ui| {
-                ui.label(hfmt("Addr"));
+                ui.label(hfmt("地址"));
             });
             header.col(|ui| {
-                ui.label(hfmt("ASM"));
+                ui.label(hfmt("汇编"));
             });
             header.col(|ui| {
-                ui.label(hfmt("Tainted"));
+                ui.label(hfmt("污点集"));
             });
         })
         .body(|body| {
@@ -1066,58 +1326,87 @@ fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<usize>
                 let tainted_job = format_tainted_job(hit);
 
                 let mut any_resp: Option<egui::Response> = None;
-                let mut add_cell_label = |ui: &mut egui::Ui, widget: egui::Label| {
-                    let r = ui.add(widget);
-                    any_resp = Some(match any_resp.take() {
-                        Some(prev) => prev.union(r.clone()),
+                let merge = |any_resp: &mut Option<egui::Response>, r: egui::Response| {
+                    *any_resp = Some(match any_resp.take() {
+                        Some(prev) => prev.union(r),
                         None => r,
                     });
+                };
+                let add_cell_label = |ui: &mut egui::Ui,
+                                      widget: egui::Label,
+                                      any_resp: &mut Option<egui::Response>| {
+                    let r = ui.add(widget);
+                    merge(any_resp, r);
+                };
+                let add_cell_label_tt = |ui: &mut egui::Ui,
+                                         widget: egui::Label,
+                                         tooltip: &str,
+                                         any_resp: &mut Option<egui::Response>| {
+                    let r = ui.add(widget).on_hover_text(tooltip);
+                    merge(any_resp, r);
                 };
 
                 row.col(|ui| {
                     add_cell_label(
                         ui,
-                        egui::Label::new(line_txt).sense(egui::Sense::click()).selectable(false),
+                        egui::Label::new(line_txt)
+                            .sense(egui::Sense::click())
+                            .selectable(false),
+                        &mut any_resp,
                     );
                 });
                 row.col(|ui| {
                     add_cell_label(
                         ui,
-                        egui::Label::new(module_txt).sense(egui::Sense::click()).selectable(false),
+                        egui::Label::new(module_txt)
+                            .sense(egui::Sense::click())
+                            .selectable(false),
+                        &mut any_resp,
                     );
                 });
                 row.col(|ui| {
                     add_cell_label(
                         ui,
-                        egui::Label::new(addr_txt).sense(egui::Sense::click()).selectable(false),
+                        egui::Label::new(addr_txt)
+                            .sense(egui::Sense::click())
+                            .selectable(false),
+                        &mut any_resp,
                     );
                 });
                 row.col(|ui| {
-                    add_cell_label(
+                    add_cell_label_tt(
                         ui,
                         egui::Label::new(asm_job)
                             .sense(egui::Sense::click())
                             .selectable(false)
                             .truncate(),
+                        // Show the whole original trace line so the user can
+                        // cross-check with the raw log (register snapshot etc.)
+                        &hit.raw_line,
+                        &mut any_resp,
                     );
                 });
                 row.col(|ui| {
-                    add_cell_label(
+                    add_cell_label_tt(
                         ui,
                         egui::Label::new(tainted_job)
                             .sense(egui::Sense::click())
                             .selectable(false)
                             .truncate(),
+                        &hit.tainted_text,
+                        &mut any_resp,
                     );
                 });
 
                 if let Some(resp) = any_resp {
                     if resp.clicked() {
                         state.selected_hit = Some(hit_idx);
+                        state.selected_offset = Some(hit.file_offset);
                     }
                     if resp.double_clicked() {
                         state.selected_hit = Some(hit_idx);
-                        jump_to = Some(hit.row);
+                        state.selected_offset = Some(hit.file_offset);
+                        jump_to = Some(hit.file_offset);
                     }
                 }
             });

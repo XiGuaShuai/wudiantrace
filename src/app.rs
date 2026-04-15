@@ -886,9 +886,9 @@ impl TextViewerApp {
                     if ui
                         .add_enabled(
                             self.file_reader.is_some(),
-                            egui::Button::new("Taint Tracking..."),
+                            egui::Button::new("污点追踪..."),
                         )
-                        .on_hover_text("Run ARM64 xgtrace taint propagation on the loaded trace")
+                        .on_hover_text("对当前 trace 运行 ARM64 xgtrace 污点传播分析")
                         .clicked()
                     {
                         self.taint.open_dialog(self.scroll_line);
@@ -897,7 +897,7 @@ impl TextViewerApp {
                     if ui
                         .add_enabled(
                             self.taint.completed.is_some(),
-                            egui::Button::new("Show Taint Results Panel"),
+                            egui::Button::new("显示污点结果面板"),
                         )
                         .clicked()
                     {
@@ -907,7 +907,7 @@ impl TextViewerApp {
                     if ui
                         .add_enabled(
                             self.taint.completed.is_some() || self.taint.running,
-                            egui::Button::new("Clear Taint Results"),
+                            egui::Button::new("清空污点结果"),
                         )
                         .clicked()
                     {
@@ -1065,15 +1065,15 @@ impl TextViewerApp {
                 if self.taint.running {
                     ui.separator();
                     ui.spinner();
-                    ui.label(format!("Taint: {}", self.taint.status_text));
+                    ui.label(format!("污点: {}", self.taint.status_text));
                 } else if let Some(c) = &self.taint.completed {
                     ui.separator();
                     ui.label(format!(
-                        "Taint: {} hits ({})",
+                        "污点: {} 条命中({})",
                         c.hits.len(),
                         match c.mode {
-                            large_text_taint::engine::TrackMode::Forward => "fwd",
-                            large_text_taint::engine::TrackMode::Backward => "bwd",
+                            large_text_taint::engine::TrackMode::Forward => "向前",
+                            large_text_taint::engine::TrackMode::Backward => "向后",
                         }
                     ));
                 }
@@ -1261,23 +1261,39 @@ impl TextViewerApp {
                                 }
                             }
 
-                            let taint_hit = self.taint.hit_rows.contains(&line_num);
-                            let taint_bg = if taint_hit {
+                            // Identify the line by its byte offset (exact),
+                            // NOT by row index (approximate in sparse mode).
+                            let line_off = start as u64;
+                            let taint_hit = self.taint.hit_offsets.contains(&line_off);
+                            let taint_selected = self.taint.selected_offset == Some(line_off);
+                            let taint_bg = if taint_selected {
+                                // Match the panel's "selected row" colour so the
+                                // main view and the panel highlight the same line
+                                // in a coherent, eye-catching hue.
+                                egui::Color32::from_rgb(255, 210, 100)
+                            } else if taint_hit {
                                 if self.dark_mode {
-                                    egui::Color32::from_rgb(120, 40, 140)
+                                    egui::Color32::from_rgb(90, 40, 120)
                                 } else {
-                                    egui::Color32::from_rgb(255, 200, 255)
+                                    egui::Color32::from_rgb(235, 200, 255)
                                 }
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
+                            // When the row is the active selection, force dark
+                            // text so it stays readable on the bright highlight.
+                            let taint_force_dark_text = taint_selected;
                             ui.horizontal(|ui| {
                                 if self.show_line_numbers {
                                     let mut ln_text =
                                         egui::RichText::new(format!("{:6} ", line_num + 1))
                                             .monospace()
-                                            .color(egui::Color32::DARK_GRAY);
-                                    if taint_hit {
+                                            .color(if taint_selected {
+                                                egui::Color32::BLACK
+                                            } else {
+                                                egui::Color32::DARK_GRAY
+                                            });
+                                    if taint_hit || taint_selected {
                                         ln_text = ln_text.background_color(taint_bg);
                                     }
                                     // Make line numbers non-selectable so drag-select only captures the content text
@@ -1299,7 +1315,9 @@ impl TextViewerApp {
                                                     font_id: egui::FontId::monospace(
                                                         self.font_size,
                                                     ),
-                                                    color: if self.dark_mode {
+                                                    color: if taint_force_dark_text {
+                                                        egui::Color32::BLACK
+                                                    } else if self.dark_mode {
                                                         egui::Color32::LIGHT_GRAY
                                                     } else {
                                                         egui::Color32::BLACK
@@ -1337,7 +1355,9 @@ impl TextViewerApp {
                                             0.0,
                                             egui::TextFormat {
                                                 font_id: egui::FontId::monospace(self.font_size),
-                                                color: if self.dark_mode {
+                                                color: if taint_force_dark_text {
+                                                    egui::Color32::BLACK
+                                                } else if self.dark_mode {
                                                     egui::Color32::LIGHT_GRAY
                                                 } else {
                                                     egui::Color32::BLACK
@@ -1355,20 +1375,35 @@ impl TextViewerApp {
                                         };
                                     }
 
-                                    ui.add(egui::Label::new(job).extend())
+                                    ui.add(
+                                        egui::Label::new(job)
+                                            .sense(egui::Sense::click())
+                                            .extend(),
+                                    )
                                 } else {
                                     let mut text = egui::RichText::new(line_text)
                                         .monospace()
                                         .size(self.font_size);
-                                    if taint_hit {
+                                    if taint_force_dark_text {
+                                        text = text.color(egui::Color32::BLACK);
+                                    }
+                                    if taint_hit || taint_selected {
                                         text = text.background_color(taint_bg);
                                     }
 
                                     // Apply wrap mode
                                     if self.wrap_mode {
-                                        ui.add(egui::Label::new(text).wrap())
+                                        ui.add(
+                                            egui::Label::new(text)
+                                                .sense(egui::Sense::click())
+                                                .wrap(),
+                                        )
                                     } else {
-                                        ui.add(egui::Label::new(text).extend())
+                                        ui.add(
+                                            egui::Label::new(text)
+                                                .sense(egui::Sense::click())
+                                                .extend(),
+                                        )
                                     }
                                 };
 
@@ -1392,7 +1427,7 @@ impl TextViewerApp {
                                         large_text_taint::engine::TaintSource,
                                     )> = None;
 
-                                    ui.label(format!("Line {}", start_line_1based));
+                                    ui.label(format!("第 {} 行", start_line_1based));
                                     ui.separator();
 
                                     if let Some(tl) = &parsed {
@@ -1400,13 +1435,13 @@ impl TextViewerApp {
                                         if targets.is_empty() {
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "(no register/mem operands on this line)",
+                                                    "(本行无寄存器/内存操作数)",
                                                 )
                                                 .small()
                                                 .italics(),
                                             );
                                         } else {
-                                            ui.menu_button("Taint backward from...", |ui| {
+                                            ui.menu_button("向后追踪起点...", |ui| {
                                                 for src in &targets {
                                                     if ui
                                                         .button(crate::taint::source_display(src))
@@ -1420,7 +1455,7 @@ impl TextViewerApp {
                                                     }
                                                 }
                                             });
-                                            ui.menu_button("Taint forward from...", |ui| {
+                                            ui.menu_button("向前追踪起点...", |ui| {
                                                 for src in &targets {
                                                     if ui
                                                         .button(crate::taint::source_display(src))
@@ -1438,14 +1473,14 @@ impl TextViewerApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(not an instruction line)")
+                                            egui::RichText::new("(此行不是指令行)")
                                                 .small()
                                                 .italics(),
                                         );
                                         ui.separator();
                                     }
 
-                                    if ui.button("Taint dialog from this line...").clicked() {
+                                    if ui.button("用对话框从本行启动...").clicked() {
                                         self.taint.open_dialog(line_num);
                                         ui.close_menu();
                                     }
@@ -1456,9 +1491,12 @@ impl TextViewerApp {
                                                 reader.clone(),
                                                 mode,
                                                 source,
+                                                // exact byte offset of the clicked line — authoritative
+                                                start as u64,
+                                                // line number is only a UI hint (may be approximate under sparse index)
                                                 start_line_1based,
                                             ) {
-                                                self.status_message = format!("Taint: {}", e);
+                                                self.status_message = format!("污点: {}", e);
                                             }
                                         }
                                     }
@@ -1608,7 +1646,11 @@ impl eframe::App for TextViewerApp {
         self.render_status_bar(ctx);
         // Taint side panel must be drawn before the central text area so the
         // central panel correctly fills the remaining space.
-        if let Some(row) = crate::taint::render_panel(ctx, &mut self.taint) {
+        if let Some(offset) = crate::taint::render_panel(ctx, &mut self.taint) {
+            // Sparse-index row numbers are approximate, but converting an
+            // exact byte_offset via `find_line_at_offset` gives the correct
+            // viewer row to scroll to.
+            let row = self.line_indexer.find_line_at_offset(offset as usize);
             self.scroll_to_row = Some(row);
             self.pending_scroll_target = Some(row);
         }

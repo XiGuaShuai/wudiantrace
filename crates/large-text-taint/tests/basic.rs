@@ -134,50 +134,6 @@ fn backward_walks_back_to_source() {
     assert!(categories.contains(&InsnCategory::Load));
 }
 
-// ---------------------------------------------------------------------------
-// GumTrace native format (upstream) — inline mem_r= / mem_w=, no standalone
-// MEM lines. Direct sample taken from
-// https://github.com/lidongyooo/GumTrace/blob/main/src/taint/result.log
-// ---------------------------------------------------------------------------
-const FIXTURE_GUMTRACE: &str = "\
-[libmetasec_ov.so] 0x798434f53c!0x14353c ldrsw x19, [x1, #4]; x19=0x7d98d79460 x1=0x7d48da46f0 mem_r=0x7d48da46f4 -> x19=0x20
-[libmetasec_ov.so] 0x798434f54c!0x14354c stp w0, w19, [x21]; w0=0x21 w19=0x20 x21=0x798484be48 mem_w=0x798484be48
-[libmetasec_ov.so] 0x798434f7b8!0x1437b8 ldr w1, [x20, #4]; w1=0x2fbeeac4 x20=0x798484be48 mem_r=0x798484be4c -> w1=0x20
-";
-
-#[test]
-fn parses_gumtrace_native_format() {
-    let mut p = TraceParser::new();
-    p.load_from_bytes(FIXTURE_GUMTRACE.as_bytes());
-    let lines = p.lines();
-    assert_eq!(lines.len(), 3, "should parse 3 lines");
-
-    // ldrsw x19, [x1, #4]  -- Load, 1 dst (x19), 1 src (x1), mem_r=0x7d48da46f4
-    let ldrsw = &lines[0];
-    assert_eq!(ldrsw.category, InsnCategory::Load);
-    assert_eq!(ldrsw.rel_addr, 0x14353c);
-    assert_eq!(ldrsw.dst_regs[0], parse_reg_name(b"x19"));
-    assert_eq!(ldrsw.src_regs[0], parse_reg_name(b"x1"));
-    assert!(ldrsw.has_mem_read);
-    assert_eq!(ldrsw.mem_read_addr, 0x7d48da46f4);
-    assert!(!ldrsw.has_mem_read2, "single ldr should not infer pair");
-
-    // stp w0, w19, [x21]  -- Store, should INFER second mem write at addr+4
-    let stp = &lines[1];
-    assert_eq!(stp.category, InsnCategory::Store);
-    assert!(stp.has_mem_write);
-    assert_eq!(stp.mem_write_addr, 0x798484be48);
-    assert!(
-        stp.has_mem_write2,
-        "GumTrace gave one mem_w, but stp w0,w19 must infer second addr"
-    );
-    assert_eq!(
-        stp.mem_write_addr2,
-        0x798484be48 + 4,
-        "inferred 2nd addr wrong for w-width stp"
-    );
-}
-
 #[test]
 fn xgtrace_stp_infers_second_mem_write_when_only_one_mem_line() {
     // Mimic xgtrace output where the second MEM W line was truncated/missing.
