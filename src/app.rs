@@ -1256,12 +1256,15 @@ impl TextViewerApp {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .drag_to_scroll(true);
 
-                // Apply programmatic scroll if requested
-                let mut programmatic_scroll = false;
+                // 需要程序化跳转时,把 ScrollArea 的初始 vertical offset
+                // 置到 target 对应的像素位置。之前还配了一个
+                // `programmatic_scroll` 标志用于"用户滚动时 reset 掉
+                // scroll_correction",但那套逻辑会导致大文件跳转后一
+                // 滚轮就飞很远,现已拆除。`pending_scroll_target` 负责
+                // 精度补偿,这里只管粗定位。
                 if let Some(target_row) = self.scroll_to_row.take() {
                     scroll_area =
                         scroll_area.vertical_scroll_offset(target_row as f32 * line_height);
-                    programmatic_scroll = true;
                 }
 
                 let mut first_visible_row = None;
@@ -1647,13 +1650,21 @@ impl TextViewerApp {
                     },
                 );
 
-                // Check for manual scroll
+                // 跟踪滚动 offset,但**不**在滚轮触发时 reset
+                // scroll_correction。
+                //
+                // 曾有一版在 !programmatic_scroll 且 offset 变化时把
+                // correction 置 0,理由是"用户滚过之后 correction 过
+                // 期了"。但代价巨大:多 GB 文件上,跳转时 correction
+                // 往往是 20-60 行(f32 滚动条精度限制),reset 那一帧
+                // 内容瞬间跳这么多行 —— 正是用户报的"滚轮一下飘很远"。
+                //
+                // 现在的策略:correction 一旦设置就跨帧保留,下一次
+                // 跳转(pending_scroll_target 被 take)才会重算。用户
+                // 在 target 附近小幅滚动,内容跟随预期移动;如果真
+                // 滚到文件开头这种极端位置,顶部会多出几十行空隙,
+                // 那是可接受的次要问题(比"飞一下"小多了)。
                 let current_offset = output.state.offset.y;
-                if !programmatic_scroll && (current_offset - self.last_scroll_offset).abs() > 1.0 {
-                    // Manual scroll detected (drag or wheel)
-                    // Reset correction as user is establishing new position
-                    self.scroll_correction = 0;
-                }
                 self.last_scroll_offset = current_offset;
 
                 // Update scroll_line to match what was actually displayed
