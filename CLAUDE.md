@@ -2,6 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## egui 交互:不要给普通 Label / RichText 加 `Sense::click` 或 `Sense::click_and_drag`
+
+任何带 interactive sense 的 widget(尤其是覆盖较大区域的 Label)会**在用户点击它时抢走当前 TextEdit 的焦点** —— 典型症状:"Ctrl+F 搜索框输入不了文字"、"输入法切出来但按键无反应"。这个问题在本项目反复出现过至少两次,每次都是手滑给 Label 加 `.sense(Sense::click())` 起的。
+
+正确做法:
+
+- **表格行点击**:用 `egui_extras::TableBuilder::sense(Sense::click())` 给整行一个 interact rect,然后 `row.response().clicked()` / `double_clicked()`。cell 里的 Label **不要**再加任何 sense。
+- **右键菜单**:直接挂在 `Response::context_menu` 上。Label 默认的 `selectable` 就包含 click sense 了,不需要再 `.sense(click)`。只在 `selectable_labels` 被禁用且确实需要 context menu 时,才考虑 `.interact(Sense::click())` 在外层容器的 response 上转一层。
+- **主视图每行**:保持 Label 无显式 sense(默认 selectable 足够做文本拖选 + 右键菜单)。
+
+写新 panel 前自测清单:
+1. 放一个 TextEdit,聚焦后打字正常
+2. 在其他 Panel/Window 里随便点一下后,回到 TextEdit,继续打字仍然正常
+任何一个失败 = 有 widget 抢焦点了,找那个 widget 去 sense。
+
 ## Non-Goals (currently)
 
 **attd** — a trace-log-based replay debugger (time-travel style: pick any instruction as "now", reconstruct registers + memory at that moment, step forward/back, reverse-cause a value). This is the planned next phase but is **explicitly out of scope today**. Do not:

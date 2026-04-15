@@ -135,9 +135,12 @@ impl SearchEngine {
                 let handle = thread::spawn(move || {
                     if let Some(regex) = regex_clone {
                         let mut pos = thread_start;
-                        // Process in smaller batches to avoid high memory usage
-                        const BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB
-                        let mut local_count = 0;
+                        // Process in smaller batches to keep per-thread memory bounded.
+                        // Bigger batch = fewer loop iterations, fewer cancel-token
+                        // checks, better regex warm-up. For mmap backing there is
+                        // no extra cost to reading a larger slice.
+                        const BATCH_SIZE: usize = 16 * 1024 * 1024; // 16MB
+                        let mut local_count: usize = 0;
 
                         while pos < thread_end {
                             if cancel_token_clone.load(Ordering::Relaxed) {
@@ -145,30 +148,30 @@ impl SearchEngine {
                             }
 
                             let batch_end = (pos + BATCH_SIZE).min(thread_end);
-                            // Add overlap to catch matches crossing batch boundaries
                             let read_end = (batch_end + overlap).min(file_len);
-
                             let chunk_bytes = reader_clone.get_bytes(pos, read_end);
-                            let chunk_text = match std::str::from_utf8(chunk_bytes) {
-                                Ok(t) => t.to_string(),
-                                Err(_) => {
-                                    let (cow, _, _) = reader_clone.encoding().decode(chunk_bytes);
-                                    cow.into_owned()
-                                }
-                            };
 
+                            // Borrow directly when the slice is valid UTF-8 (the
+                            // common case for ASCII traces) — zero allocation,
+                            // zero memcpy. Only pay decode cost when the file
+                            // really isn't UTF-8.
+                            let chunk_text: std::borrow::Cow<str> =
+                                match std::str::from_utf8(chunk_bytes) {
+                                    Ok(t) => std::borrow::Cow::Borrowed(t),
+                                    Err(_) => {
+                                        let (cow, _, _) = reader_clone.encoding().decode(chunk_bytes);
+                                        cow
+                                    }
+                                };
+
+                            let relative_batch_end = batch_end - pos;
                             for mat in regex.find_iter(&chunk_text) {
-                                if cancel_token_clone.load(Ordering::Relaxed) {
-                                    return;
-                                }
                                 let match_start = mat.start();
-                                let absolute_start = pos + match_start;
-
-                                // Only accept matches starting in [pos, batch_end)
-                                if absolute_start >= batch_end {
+                                // Drop matches that start inside the overlap region —
+                                // the next batch is responsible for them.
+                                if match_start >= relative_batch_end {
                                     continue;
                                 }
-
                                 local_count += 1;
                             }
 
@@ -211,7 +214,9 @@ impl SearchEngine {
 
         thread::spawn(move || {
             if let Some(regex) = regex {
-                const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB chunks
+                // Bigger chunk = fewer allocations of local match vectors and
+                // fewer overlap re-scans. mmap makes large slices free.
+                const CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
                 let mut chunk_start = start_offset;
                 let mut results_found = 0;
 
@@ -223,44 +228,35 @@ impl SearchEngine {
                     let chunk_end = (chunk_start + CHUNK_SIZE).min(file_len);
                     let chunk_bytes = reader.get_bytes(chunk_start, chunk_end);
 
-                    let chunk_text = match std::str::from_utf8(chunk_bytes) {
-                        Ok(t) => t.to_string(),
+                    // Zero-copy UTF-8 path for the common case.
+                    let chunk_text: std::borrow::Cow<str> = match std::str::from_utf8(chunk_bytes) {
+                        Ok(t) => std::borrow::Cow::Borrowed(t),
                         Err(_) => {
                             let (cow, _, _) = reader.encoding().decode(chunk_bytes);
-                            cow.into_owned()
+                            cow
                         }
                     };
 
-                    let mut local_matches = Vec::new();
-
-                    // Define the valid range for starting positions in this chunk
-                    // We want to process matches that start in [chunk_start, chunk_end - overlap)
-                    // Unless we are at the end of the file, then [chunk_start, chunk_end)
                     let valid_end = if chunk_end >= file_len {
                         file_len
                     } else {
                         chunk_end - overlap
                     };
+                    let relative_valid_end = valid_end - chunk_start;
+                    // Pre-size: most result sets yield ~hundreds of matches per
+                    // 32 MB; avoids multiple reallocs.
+                    let mut local_matches = Vec::with_capacity(256);
 
                     for mat in regex.find_iter(&chunk_text) {
-                        if cancel_token.load(Ordering::Relaxed) {
-                            return;
-                        }
                         if results_found >= max_results {
                             break;
                         }
-
                         let match_start = mat.start();
-                        let absolute_start = chunk_start + match_start;
-
-                        // Skip matches that start beyond our valid range for this chunk
-                        // They will be picked up by the next chunk which starts at `valid_end`
-                        if absolute_start >= valid_end {
+                        if match_start >= relative_valid_end {
                             continue;
                         }
-
                         local_matches.push(SearchResult {
-                            byte_offset: absolute_start,
+                            byte_offset: chunk_start + match_start,
                             match_len: mat.end() - mat.start(),
                         });
                         results_found += 1;
@@ -276,11 +272,9 @@ impl SearchEngine {
                         return;
                     }
 
-                    // Move to next chunk with overlap
                     if chunk_end >= file_len {
                         break;
                     }
-
                     chunk_start = chunk_end - overlap;
                 }
                 if !cancel_token.load(Ordering::Relaxed) {

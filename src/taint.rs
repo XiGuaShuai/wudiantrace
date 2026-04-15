@@ -939,27 +939,49 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
     // Dock as a side panel / bottom panel. The central text area takes
     // whatever space is left — there is no overlap with the editor.
     // Each side keeps its own id so widths/heights are remembered per dock.
+    //
+    // The inner `ScrollArea` is load-bearing, not cosmetic: egui's SidePanel
+    // persists `inner_response.response.rect` as the panel's new width every
+    // frame, so any content whose `min_rect` varies (long status text, wide
+    // hits table) would make the panel oscillate in size during a job. A
+    // ScrollArea is the only built-in container whose outer rect is driven
+    // by its *allocation*, not by its inner content (see egui
+    // `scroll_area.rs:553`), so it cleanly absorbs those variations.
+    // `auto_shrink([false, false])` keeps the scroll area filling the panel
+    // even when content is small (otherwise the panel would shrink back).
     match state.dock_side {
         DockSide::Right => {
             egui::SidePanel::right("taint_panel_right")
                 .resizable(true)
                 .default_width(360.0)
                 .min_width(240.0)
-                .show(ctx, |ui| body(ui, state));
+                .show(ctx, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| body(ui, state));
+                });
         }
         DockSide::Left => {
             egui::SidePanel::left("taint_panel_left")
                 .resizable(true)
                 .default_width(360.0)
                 .min_width(240.0)
-                .show(ctx, |ui| body(ui, state));
+                .show(ctx, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| body(ui, state));
+                });
         }
         DockSide::Bottom => {
             egui::TopBottomPanel::bottom("taint_panel_bottom")
                 .resizable(true)
                 .default_height(180.0)
                 .min_height(100.0)
-                .show(ctx, |ui| body(ui, state));
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| body(ui, state));
+                });
         }
     }
 
@@ -1300,6 +1322,10 @@ fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
     TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
+        // Row-level click sense — cell labels themselves stay non-interactive
+        // so they can never steal focus from TextEdits elsewhere (e.g. the
+        // Ctrl+F search bar).
+        .sense(egui::Sense::click())
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::initial(70.0).at_least(50.0))
         .column(Column::initial(170.0).at_least(80.0))
@@ -1352,89 +1378,34 @@ fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
                 let asm_job = format_asm_job(&hit.asm);
                 let tainted_job = format_tainted_job(hit);
 
-                let mut any_resp: Option<egui::Response> = None;
-                let merge = |any_resp: &mut Option<egui::Response>, r: egui::Response| {
-                    *any_resp = Some(match any_resp.take() {
-                        Some(prev) => prev.union(r),
-                        None => r,
-                    });
-                };
-                let add_cell_label = |ui: &mut egui::Ui,
-                                      widget: egui::Label,
-                                      any_resp: &mut Option<egui::Response>| {
-                    let r = ui.add(widget);
-                    merge(any_resp, r);
-                };
-                let add_cell_label_tt = |ui: &mut egui::Ui,
-                                         widget: egui::Label,
-                                         tooltip: &str,
-                                         any_resp: &mut Option<egui::Response>| {
-                    let r = ui.add(widget).on_hover_text(tooltip);
-                    merge(any_resp, r);
-                };
-
                 row.col(|ui| {
-                    add_cell_label(
-                        ui,
-                        egui::Label::new(line_txt)
-                            .sense(egui::Sense::click())
-                            .selectable(false),
-                        &mut any_resp,
-                    );
+                    ui.add(egui::Label::new(line_txt).selectable(false));
                 });
                 row.col(|ui| {
-                    add_cell_label(
-                        ui,
-                        egui::Label::new(module_txt)
-                            .sense(egui::Sense::click())
-                            .selectable(false),
-                        &mut any_resp,
-                    );
+                    ui.add(egui::Label::new(module_txt).selectable(false));
                 });
                 row.col(|ui| {
-                    add_cell_label(
-                        ui,
-                        egui::Label::new(addr_txt)
-                            .sense(egui::Sense::click())
-                            .selectable(false),
-                        &mut any_resp,
-                    );
+                    ui.add(egui::Label::new(addr_txt).selectable(false));
                 });
                 row.col(|ui| {
-                    add_cell_label_tt(
-                        ui,
-                        egui::Label::new(asm_job)
-                            .sense(egui::Sense::click())
-                            .selectable(false)
-                            .truncate(),
-                        // Show the whole original trace line so the user can
-                        // cross-check with the raw log (register snapshot etc.)
-                        &hit.raw_line,
-                        &mut any_resp,
-                    );
+                    ui.add(egui::Label::new(asm_job).selectable(false).truncate());
                 });
                 row.col(|ui| {
-                    add_cell_label_tt(
-                        ui,
-                        egui::Label::new(tainted_job)
-                            .sense(egui::Sense::click())
-                            .selectable(false)
-                            .truncate(),
-                        &hit.tainted_text,
-                        &mut any_resp,
-                    );
+                    ui.add(egui::Label::new(tainted_job).selectable(false).truncate());
                 });
 
-                if let Some(resp) = any_resp {
-                    if resp.clicked() {
-                        state.selected_hit = Some(hit_idx);
-                        state.selected_offset = Some(hit.file_offset);
-                    }
-                    if resp.double_clicked() {
-                        state.selected_hit = Some(hit_idx);
-                        state.selected_offset = Some(hit.file_offset);
-                        jump_to = Some(hit.file_offset);
-                    }
+                // One interact rect for the whole row — cells above have no
+                // Sense, so the search bar (and any other TextEdit) keeps its
+                // focus even when the panel is on screen.
+                let row_resp = row.response().on_hover_text(&hit.raw_line);
+                if row_resp.clicked() {
+                    state.selected_hit = Some(hit_idx);
+                    state.selected_offset = Some(hit.file_offset);
+                }
+                if row_resp.double_clicked() {
+                    state.selected_hit = Some(hit_idx);
+                    state.selected_offset = Some(hit.file_offset);
+                    jump_to = Some(hit.file_offset);
                 }
             });
         });

@@ -1,6 +1,7 @@
 use eframe::egui;
 use encoding_rs::Encoding;
 use notify::{RecursiveMode, Result as NotifyResult, Watcher};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{
@@ -97,6 +98,14 @@ pub struct TextViewerApp {
     // Search results list panel (010-Editor-style)
     show_search_list: bool,
     search_list_dock: crate::taint::DockSide,
+    /// Per-page preview cache. Computing a 160-byte preview + UTF-8 decode for
+    /// every visible row every frame dropped UI FPS noticeably; caching the
+    /// strings for as long as the search page doesn't change is O(page_size)
+    /// once and O(1) per frame.
+    search_preview_cache: HashMap<usize, String>,
+    /// Identity of the page currently cached — (page_start_index, page_len,
+    /// query string). When any of these differ from the live state we rebuild.
+    search_preview_cache_key: Option<(usize, usize, String)>,
 }
 
 #[derive(Clone)]
@@ -161,11 +170,40 @@ impl Default for TextViewerApp {
             taint: TaintState::default(),
             show_search_list: true,
             search_list_dock: crate::taint::DockSide::Bottom,
+            search_preview_cache: HashMap::new(),
+            search_preview_cache_key: None,
         }
     }
 }
 
 impl TextViewerApp {
+    /// Sniff the first 4 KB for BOM/UTF-8 to pick an encoding, then load the
+    /// file via `open_file`. Used by both the File > Open dialog and the
+    /// drag-and-drop handler.
+    fn load_file_with_auto_encoding(&mut self, path: PathBuf) {
+        if let Ok(mut file) = std::fs::File::open(&path) {
+            let mut buffer = [0u8; 4096];
+            if let Ok(n) = std::io::Read::read(&mut file, &mut buffer) {
+                self.selected_encoding = detect_encoding(&buffer[..n]);
+            }
+        }
+        self.open_file(path);
+    }
+
+    /// Sparse-aware wrapper for `LineIndexer::find_line_at_offset`. The
+    /// underlying sparse path needs the raw bytes to scan newlines between
+    /// a checkpoint and the query offset; we always hold them in
+    /// `file_reader` during any code path that operates on byte offsets
+    /// (searching, taint jumping, etc.), so the `expect` below is a
+    /// precondition, not a guess.
+    fn line_at(&self, offset: usize) -> usize {
+        let reader = self
+            .file_reader
+            .as_ref()
+            .expect("file must be loaded before resolving a line number");
+        self.line_indexer.find_line_at_offset(offset, reader)
+    }
+
     fn open_file(&mut self, path: PathBuf) {
         self.open_start_time = Some(std::time::Instant::now());
         match FileReader::new(path.clone(), self.selected_encoding) {
@@ -425,9 +463,7 @@ impl TextViewerApp {
 
                     // Ensure we scroll to the first result if we haven't yet
                     if self.scroll_to_row.is_none() && !self.search_results.is_empty() {
-                        let target_line = self
-                            .line_indexer
-                            .find_line_at_offset(self.search_results[0].byte_offset);
+                        let target_line = self.line_at(self.search_results[0].byte_offset);
                         self.scroll_line = target_line;
                         self.scroll_to_row = Some(target_line);
                     }
@@ -446,9 +482,7 @@ impl TextViewerApp {
                     && !self.search_results.is_empty()
                     && self.current_result_index == 0
                 {
-                    let target_line = self
-                        .line_indexer
-                        .find_line_at_offset(self.search_results[0].byte_offset);
+                    let target_line = self.line_at(self.search_results[0].byte_offset);
                     self.scroll_line = target_line;
                     self.scroll_to_row = Some(target_line);
                 }
@@ -659,7 +693,7 @@ impl TextViewerApp {
             self.current_result_index = next_index;
             let local_index = next_index - self.search_page_start_index;
             let result = &self.search_results[local_index];
-            let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
+            let target_line = self.line_at(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
             self.pending_scroll_target = Some(target_line);
@@ -709,7 +743,7 @@ impl TextViewerApp {
             self.current_result_index = prev_index;
             let local_index = prev_index - self.search_page_start_index;
             let result = &self.search_results[local_index];
-            let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
+            let target_line = self.line_at(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
             self.pending_scroll_target = Some(target_line);
@@ -806,14 +840,7 @@ impl TextViewerApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            // Auto-detect encoding
-                            if let Ok(mut file) = std::fs::File::open(&path) {
-                                let mut buffer = [0; 4096];
-                                if let Ok(n) = std::io::Read::read(&mut file, &mut buffer) {
-                                    self.selected_encoding = detect_encoding(&buffer[..n]);
-                                }
-                            }
-                            self.open_file(path);
+                            self.load_file_with_auto_encoding(path);
                         }
                         ui.close_menu();
                     }
@@ -940,12 +967,24 @@ impl TextViewerApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Search:");
-                let response =
-                    ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(300.0));
+                // Stable id so we can probe focus status from elsewhere
+                // (status bar) without holding the response.
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .id(egui::Id::new("search_toolbar_input"))
+                        .desired_width(300.0),
+                );
 
+                // egui's request_focus takes effect on the *next* frame, so a
+                // single request after Ctrl+F is racy — if any other widget
+                // also tries to set focus that frame we lose. Keep retrying
+                // every frame until the TextEdit actually owns focus, then
+                // clear the flag.
                 if self.focus_search_input {
                     response.request_focus();
-                    self.focus_search_input = false;
+                    if response.has_focus() {
+                        self.focus_search_input = false;
+                    }
                 }
 
                 ui.checkbox(&mut self.case_sensitive, "Aa")
@@ -1055,6 +1094,12 @@ impl TextViewerApp {
     }
 
     fn render_status_bar(&mut self, ctx: &egui::Context) {
+        // Probe focus before drawing so we can show it on the right side of
+        // the bar — useful when debugging "the search bar swallowed my keys".
+        let search_id = egui::Id::new("search_toolbar_input");
+        let search_focused = ctx.memory(|m| m.has_focus(search_id));
+        let any_focused_id = ctx.memory(|m| m.focused());
+
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(ref reader) = self.file_reader {
@@ -1090,6 +1135,36 @@ impl TextViewerApp {
                             large_text_taint::engine::TrackMode::Backward => "向后",
                         }
                     ));
+                }
+
+                // Right-aligned focus indicator for the search box. Helpful
+                // when debugging "Ctrl+F won't accept input" — if this shows
+                // ✗ while the search bar is open, focus is being stolen.
+                if self.show_search_bar {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (mark, color) = if search_focused {
+                            ("✓", egui::Color32::from_rgb(140, 230, 140))
+                        } else {
+                            ("✗", egui::Color32::from_rgb(240, 150, 150))
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("搜索框焦点 {}", mark))
+                                .size(11.0)
+                                .color(color),
+                        );
+                        if !search_focused {
+                            if let Some(other) = any_focused_id {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "(焦点在 {:?})  ",
+                                        other
+                                    ))
+                                    .size(10.0)
+                                    .color(egui::Color32::from_rgb(180, 180, 100)),
+                                );
+                            }
+                        }
+                    });
                 }
             });
         });
@@ -1582,6 +1657,32 @@ impl TextViewerApp {
         let rows_count = self.search_results.len();
         let current_global = self.current_result_index;
 
+        // Incremental preview cache:
+        //  * on page-index or query change → full clear (stale previews)
+        //  * on rows_count growth (Find-All streaming in new chunks) → only
+        //    compute previews for byte_offsets that aren't cached yet
+        // Net: each preview is computed at most once for its lifetime in the
+        // panel — O(n) total work, instead of O(n²) when rebuilt every chunk.
+        let page_or_query_changed = match &self.search_preview_cache_key {
+            Some((pstart, _, q)) => *pstart != page_start || *q != self.search_query,
+            None => true,
+        };
+        if page_or_query_changed {
+            self.search_preview_cache.clear();
+            self.search_preview_cache.reserve(rows_count);
+        }
+        if page_or_query_changed
+            || self.search_preview_cache.len() < rows_count
+        {
+            for r in &self.search_results {
+                self.search_preview_cache
+                    .entry(r.byte_offset)
+                    .or_insert_with(|| preview_for_match(&reader, r));
+            }
+            self.search_preview_cache_key =
+                Some((page_start, rows_count, self.search_query.clone()));
+        }
+
         let mut jump_global_idx: Option<usize> = None;
         let mut close_clicked = false;
         let mut dock_side = self.search_list_dock;
@@ -1680,6 +1781,9 @@ impl TextViewerApp {
                 TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
+                    // Give rows (not individual labels) click sense so
+                    // TextEdit focus elsewhere isn't stolen by cell labels.
+                    .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::initial(60.0).at_least(40.0))
                     .column(Column::initial(90.0).at_least(60.0))
@@ -1713,10 +1817,14 @@ impl TextViewerApp {
                             let is_current = global_idx == current_global;
                             row.set_selected(is_current);
 
-                            let viewer_line =
-                                self.line_indexer.find_line_at_offset(result.byte_offset);
+                            let viewer_line = self.line_at(result.byte_offset);
 
-                            let preview = preview_for_match(&reader, result);
+                            // O(1) cached lookup (built once per page above).
+                            let preview = self
+                                .search_preview_cache
+                                .get(&result.byte_offset)
+                                .cloned()
+                                .unwrap_or_default();
 
                             let idx_color = if is_current {
                                 egui::Color32::from_rgb(255, 210, 100)
@@ -1727,103 +1835,104 @@ impl TextViewerApp {
                             let off_color = egui::Color32::from_rgb(160, 200, 240);
                             let prev_color = egui::Color32::from_rgb(225, 225, 225);
 
-                            let mut any_resp: Option<egui::Response> = None;
-                            let merge = |any_resp: &mut Option<egui::Response>,
-                                         r: egui::Response| {
-                                *any_resp = Some(match any_resp.take() {
-                                    Some(prev) => prev.union(r),
-                                    None => r,
-                                });
-                            };
-
+                            // Cells are plain labels with no Sense — the row's
+                            // interact rect (enabled by .sense(click) on
+                            // TableBuilder) is what captures click events.
                             row.col(|ui| {
-                                let r = ui.add(
+                                ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(format!("{}", global_idx + 1))
                                             .monospace()
                                             .size(12.0)
                                             .color(idx_color),
                                     )
-                                    .sense(egui::Sense::click())
                                     .selectable(false),
                                 );
-                                merge(&mut any_resp, r);
                             });
                             row.col(|ui| {
-                                let r = ui.add(
+                                ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(format!("{}", viewer_line + 1))
                                             .monospace()
                                             .size(12.0)
                                             .color(line_color),
                                     )
-                                    .sense(egui::Sense::click())
                                     .selectable(false),
                                 );
-                                merge(&mut any_resp, r);
                             });
                             row.col(|ui| {
-                                let r = ui.add(
+                                ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(format!(
-                                            "0x{:x}",
-                                            result.byte_offset
-                                        ))
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(off_color),
+                                        egui::RichText::new(format!("0x{:x}", result.byte_offset))
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(off_color),
                                     )
-                                    .sense(egui::Sense::click())
                                     .selectable(false),
                                 );
-                                merge(&mut any_resp, r);
                             });
                             row.col(|ui| {
-                                let r = ui.add(
+                                ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(&preview)
                                             .monospace()
                                             .size(12.0)
                                             .color(prev_color),
                                     )
-                                    .sense(egui::Sense::click())
                                     .selectable(false)
                                     .truncate(),
-                                )
-                                .on_hover_text(&preview);
-                                merge(&mut any_resp, r);
+                                );
                             });
 
-                            if let Some(resp) = any_resp {
-                                if resp.double_clicked() {
-                                    jump_global_idx = Some(global_idx);
-                                }
+                            let row_resp = row.response().on_hover_text(&preview);
+                            if row_resp.double_clicked() {
+                                jump_global_idx = Some(global_idx);
                             }
                         });
                     });
         };
 
+        // The inner `ScrollArea` is load-bearing, not cosmetic: egui's panel
+        // persists `inner_response.response.rect` as the panel's new size
+        // every frame, so content whose `min_rect` varies (long preview
+        // strings, wide columns, changing row count) would make the panel
+        // oscillate. A ScrollArea's outer rect is driven by its *allocation*
+        // not its inner content (egui `scroll_area.rs:553`), so it cleanly
+        // absorbs those variations. `auto_shrink([false, false])` keeps the
+        // scroll area filling the panel even when content is small.
         match self.search_list_dock {
             DockSide::Right => {
                 egui::SidePanel::right("search_list_right")
                     .resizable(true)
                     .default_width(360.0)
                     .min_width(240.0)
-                    .show(ctx, body);
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .auto_shrink([false, false])
+                            .show(ui, body);
+                    });
             }
             DockSide::Left => {
                 egui::SidePanel::left("search_list_left")
                     .resizable(true)
                     .default_width(360.0)
                     .min_width(240.0)
-                    .show(ctx, body);
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .auto_shrink([false, false])
+                            .show(ui, body);
+                    });
             }
             DockSide::Bottom => {
                 egui::TopBottomPanel::bottom("search_list_bottom")
                     .resizable(true)
                     .default_height(150.0)
                     .min_height(80.0)
-                    .show(ctx, body);
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, body);
+                    });
             }
         }
         self.search_list_dock = dock_side;
@@ -1837,7 +1946,7 @@ impl TextViewerApp {
             if global_idx >= page_start && global_idx < page_start + rows_count {
                 let local = global_idx - page_start;
                 let result = &self.search_results[local];
-                let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
+                let target_line = self.line_at(result.byte_offset);
                 self.current_result_index = global_idx;
                 self.scroll_line = target_line;
                 self.scroll_to_row = Some(target_line);
@@ -1873,6 +1982,20 @@ impl TextViewerApp {
 
 impl eframe::App for TextViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- Drag-and-drop file loading -----------------------------------
+        // Grab any files released this frame. When multiple files are dropped
+        // we only load the first one — the viewer is single-file at a time.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if let Some(path) = dropped.into_iter().next() {
+            self.load_file_with_auto_encoding(path);
+        }
+
         if let Some(start_time) = self.open_start_time {
             let elapsed = start_time.elapsed();
             println!("File opened and first frame rendered in: {:.2?}", elapsed);
@@ -1922,11 +2045,14 @@ impl eframe::App for TextViewerApp {
         self.poll_search_results();
         self.poll_replace_results();
         if self.taint.poll() || self.taint.running {
-            ctx.request_repaint();
+            // ~20 fps is plenty to animate the spinner / status text; a full
+            // 60 fps repaint loop while a background job runs eats CPU and
+            // makes every other widget feel sluggish.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         if self.search_in_progress || self.replace_in_progress {
-            ctx.request_repaint(); // Keep spinner animated during long searches
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         self.render_menu_bar(ctx);
@@ -1936,10 +2062,9 @@ impl eframe::App for TextViewerApp {
         // CentralPanel (render_text_area), otherwise egui can't subtract their
         // space and the bottom panel ends up overlapping the text area.
         if let Some(offset) = crate::taint::render_panel(ctx, &mut self.taint) {
-            // Sparse-index row numbers are approximate, but converting an
-            // exact byte_offset via `find_line_at_offset` gives the correct
-            // viewer row to scroll to.
-            let row = self.line_indexer.find_line_at_offset(offset as usize);
+            // `line_at` resolves exactly even in sparse mode — the panel's
+            // line number and the viewer row we scroll to now agree.
+            let row = self.line_at(offset as usize);
             self.scroll_to_row = Some(row);
             self.pending_scroll_target = Some(row);
         }
@@ -1948,6 +2073,40 @@ impl eframe::App for TextViewerApp {
         crate::taint::render_dialog(ctx, &mut self.taint, self.file_reader.as_ref());
         self.render_encoding_selector(ctx);
         self.render_file_info(ctx);
+
+        // Drop-zone overlay: when the OS reports files being dragged over the
+        // window, dim the screen and show an instruction. Painted last so it
+        // sits above every panel.
+        let hovered = ctx.input(|i| i.raw.hovered_files.len());
+        if hovered > 0 {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_zone_overlay"),
+            ));
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+            let label = if hovered == 1 {
+                "📂  松开以加载该文件".to_string()
+            } else {
+                format!("📂  松开以加载第 1 个文件(共拖入 {})", hovered)
+            };
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(28.0),
+                egui::Color32::from_rgb(255, 220, 120),
+            );
+            // Sub-hint
+            painter.text(
+                screen.center() + egui::vec2(0.0, 36.0),
+                egui::Align2::CENTER_CENTER,
+                "(自动检测编码)",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(200, 200, 200),
+            );
+            ctx.request_repaint();
+        }
     }
 }
 

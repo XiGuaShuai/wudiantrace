@@ -64,6 +64,12 @@ pub struct TaintEngine {
     tainted_mem: HashSet<u64>,
     results: Vec<ResultEntry>,
     stop_reason: StopReason,
+    /// Parser-lines index of the instruction the last `run()` started at.
+    /// `None` if `run()` was never called or started with empty input.
+    /// Surfaced in `format_result` so the log makes it obvious which line
+    /// the engine actually treated as the start — critical when the UI's
+    /// displayed line number disagrees with the parser's exact one.
+    start_index: Option<usize>,
 }
 
 impl Default for TaintEngine {
@@ -84,6 +90,7 @@ impl TaintEngine {
             tainted_mem: HashSet::new(),
             results: Vec::new(),
             stop_reason: StopReason::EndOfTrace,
+            start_index: None,
         }
     }
 
@@ -406,9 +413,11 @@ impl TaintEngine {
     pub fn run(&mut self, lines: &[TraceLine], start_index: usize) {
         self.results.clear();
         self.stop_reason = StopReason::EndOfTrace;
+        self.start_index = None;
         if lines.is_empty() || start_index >= lines.len() {
             return;
         }
+        self.start_index = Some(start_index);
 
         match self.mode {
             TrackMode::Forward => {
@@ -528,6 +537,19 @@ impl TaintEngine {
             out.push_str(reg_name(self.source.reg));
         }
         out.push('\n');
+        // Record the exact trace-line number / byte offset the engine
+        // actually started at. The UI may show an approximate line number
+        // in sparse-index mode, so emitting both numbers here is the only
+        // way to reconcile "I clicked line N" with "log says it started
+        // at line M".
+        if let Some(idx) = self.start_index {
+            if let Some(tl) = lines.get(idx) {
+                out.push_str(&format!(
+                    "Started from: line {} (file offset 0x{:x})\n",
+                    tl.line_number, tl.file_offset
+                ));
+            }
+        }
         out.push_str(&format!(
             "Total matched: {} instructions\n",
             self.results.len()
