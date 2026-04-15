@@ -64,11 +64,11 @@ pub struct TaintEngine {
     tainted_mem: HashSet<u64>,
     results: Vec<ResultEntry>,
     stop_reason: StopReason,
-    /// Parser-lines index of the instruction the last `run()` started at.
-    /// `None` if `run()` was never called or started with empty input.
-    /// Surfaced in `format_result` so the log makes it obvious which line
-    /// the engine actually treated as the start — critical when the UI's
-    /// displayed line number disagrees with the parser's exact one.
+    /// 上次 `run()` 的起点在 parser.lines() 里的下标。`None` 表示从未
+    /// 调用过 run()。`format_result` 里会根据这个字段在日志 header
+    /// 打印 "Started from: line N (file offset 0xXXX)" —— 历史上
+    /// 出现过"主视图行号和 parser 精确行号不一致"的混乱(稀疏索引
+    /// 估算偏差),把精确起点行号/字节写进日志可一眼对账。
     start_index: Option<usize>,
 }
 
@@ -537,11 +537,10 @@ impl TaintEngine {
             out.push_str(reg_name(self.source.reg));
         }
         out.push('\n');
-        // Record the exact trace-line number / byte offset the engine
-        // actually started at. The UI may show an approximate line number
-        // in sparse-index mode, so emitting both numbers here is the only
-        // way to reconcile "I clicked line N" with "log says it started
-        // at line M".
+        // 记录 engine 实际起点的"trace 行号 + 文件字节 offset"。
+        // 主视图在稀疏索引模式下显示的行号是估算的,与 parser 精确数
+        // `\n` 得到的行号可能差几行;日志里把精确起点写明,就能一眼
+        // 对上"我点的是 N 行"和"日志说从 M 行开始"。
         if let Some(idx) = self.start_index {
             if let Some(tl) = lines.get(idx) {
                 out.push_str(&format!(

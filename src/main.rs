@@ -24,14 +24,13 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Slow the mouse-wheel line-scroll speed. egui 0.31's default is 40 points
-/// per line of wheel input (decided by the consensus in
-/// <https://github.com/emilk/egui/issues/461>) — on Windows, where the OS
-/// typically emits 3 lines per wheel notch, that produces ~120 points ≈ 8
-/// lines of scroll per notch. For a text viewer that lands jarringly far
-/// from the caret, especially in gigabyte-sized files where a small visual
-/// jump is already many rows away. 15 gives ~45 points ≈ 3 lines per notch,
-/// which matches typical editor defaults.
+/// 调慢鼠标滚轮滚动速度。
+///
+/// egui 0.31 的默认 `line_scroll_speed = 40`(参考
+/// <https://github.com/emilk/egui/issues/461>)—— Windows 滚轮一格
+/// 默认发 3 线 LineDelta,乘起来一次 ≈120 点 ≈ 8 行。对文本查看器
+/// 来说跳太远了,尤其大文件里一点点滚动就飞出视口。改成 15 → 一格
+/// ≈45 点 ≈ 3 行,贴近常见编辑器手感。
 fn tune_scroll_speed(ctx: &egui::Context) {
     ctx.options_mut(|opts| {
         opts.line_scroll_speed = 15.0;

@@ -286,27 +286,24 @@ impl SearchEngine {
         });
     }
 
-    /// One-pass parallel Find All: count **and** collect match positions in
-    /// the same scan of the file. Replaces the old two-pass
-    /// (`count_matches` → `fetch_matches`) flow for the "Find All" button,
-    /// which read the bytes twice and only parallelized the counting half.
+    /// Find All 的单次并行扫:在同一次遍历里**同时**计数和收集命中位置。
+    /// 替换掉老的双 pass 流程(`count_matches` 并行数 → `fetch_matches`
+    /// 串行收位置),老流程字节读了两遍,而且收集位置那半还是单线程。
     ///
-    /// Each worker scans its chunk, captures up to its local share of
-    /// `max_results` positions, always counts every hit, and streams both
-    /// chunk-local results (via `ChunkResult`) and its running total (via
-    /// `CountResult`) back to the UI as they're ready. The UI drops the
-    /// match list into `search_results`, re-sorts by byte offset per frame
-    /// (already the existing behavior), and truncates to the requested
-    /// page size.
+    /// 每个 worker 扫自己那段字节:
+    /// * 把本地命中收进 Vec,受本线程配额限制(`max_results / 线程数`)
+    /// * 始终对**所有**命中计数(不管收不收),保证全局 count 精确
+    /// * 随时往 UI 发 `ChunkResult`(位置)和 `CountResult`(本段计数)
     ///
-    /// Tradeoff: for pathological queries whose match count vastly exceeds
-    /// `max_results`, the reported positions are *approximately* the first
-    /// `max_results` in the file — they're correct per-thread-chunk, but if
-    /// one chunk has more matches than its local quota, later chunks'
-    /// matches may "jump ahead" in what gets displayed. The total count is
-    /// always exact. For the common case (thousands of matches, sparse
-    /// across the file) the displayed set is identical to a sequential
-    /// scan's.
+    /// UI 侧每帧对 `search_results` 做 `sort_by_key(byte_offset)`(原本
+    /// 就有这个逻辑),所以最终展示顺序和老的串行 fetch 完全一致 ——
+    /// 只是快 N 倍(多核 I/O 并发,不再是单线程从 byte 0 线性走到尾)。
+    ///
+    /// **权衡**:病态查询(命中数远超 `max_results`)情况下,展示的前
+    /// `max_results` 条是"**大致**前 N 条" —— 每个 chunk 内部是精确
+    /// 排序的,但如果某个 chunk 命中超过本地配额,后面 chunk 的命中
+    /// 可能"插队"进来。全局 count 始终精确。常见场景(几十~几千命中
+    /// 稀疏分布)显示结果与串行完全一致。
     pub fn find_all_parallel(
         &self,
         reader: Arc<FileReader>,
@@ -401,18 +398,13 @@ impl SearchEngine {
                             }
                         }
 
-                        // Early exit of the I/O loop if this thread is full
-                        // and the global quota is met — no point eating more
-                        // disk bandwidth if we can't store what we find. We
-                        // still count everything via the *other* threads'
-                        // partial scans, so the final total will be an
-                        // approximation capped by work-completed when the
-                        // quota is tiny. For typical max_results = 1000 this
-                        // is fine; exact counts use the no-quota path below.
+                        // 本线程本地槽满 + 全局配额满,继续扫只数不
+                        // 收 —— 省得占额外内存。全局 count 仍然精确,
+                        // 因为上面的 `local_count += 1` 不受配额限制。
                         if local_matches.len() >= per_thread_cap
                             && global_collected_clone.load(Ordering::Relaxed) >= max_results
                         {
-                            // Keep scanning but without accumulating.
+                            // 继续扫,不再 push 到 local_matches。
                         }
 
                         pos = batch_end;

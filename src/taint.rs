@@ -940,15 +940,22 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
     // whatever space is left — there is no overlap with the editor.
     // Each side keeps its own id so widths/heights are remembered per dock.
     //
-    // The inner `ScrollArea` is load-bearing, not cosmetic: egui's SidePanel
-    // persists `inner_response.response.rect` as the panel's new width every
-    // frame, so any content whose `min_rect` varies (long status text, wide
-    // hits table) would make the panel oscillate in size during a job. A
-    // ScrollArea is the only built-in container whose outer rect is driven
-    // by its *allocation*, not by its inner content (see egui
-    // `scroll_area.rs:553`), so it cleanly absorbs those variations.
-    // `auto_shrink([false, false])` keeps the scroll area filling the panel
-    // even when content is small (otherwise the panel would shrink back).
+    // 内层 `ScrollArea` **不是装饰**,它是面板宽度稳定的关键:
+    //
+    // egui 的 SidePanel 每帧会把 `inner_response.response.rect` 存回
+    // PanelState(`egui-0.31/src/containers/panel.rs`),下一帧再读取。
+    // 也就是说面板宽度 = 上一帧内容的 min_rect。如果内容 min_rect 随帧
+    // 变化(污点运行时长状态消息、命中表格列宽…),面板宽度就会跟着
+    // 抖动 —— 进而 CentralPanel rect 跳动,TextEdit 键盘事件路由会
+    // 间歇失效(表现就是"搜索框按不进字")。
+    //
+    // ScrollArea 是 egui 里唯一一个"outer rect 由 allocation 决定而
+    // 非 content 决定"的容器(`scroll_area.rs:553` 那行
+    // `outer_size = available_outer.size().at_most(max_size)`),所以它
+    // 天然截断 min_rect 的向上传播。
+    //
+    // `auto_shrink([false, false])` 防止 ScrollArea 在内容少时反向缩
+    // 小,否则面板会在"内容多/少"之间来回抖。
     match state.dock_side {
         DockSide::Right => {
             egui::SidePanel::right("taint_panel_right")

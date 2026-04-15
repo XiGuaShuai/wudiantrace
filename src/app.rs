@@ -98,18 +98,19 @@ pub struct TextViewerApp {
     // Search results list panel (010-Editor-style)
     show_search_list: bool,
     search_list_dock: crate::taint::DockSide,
-    /// Per-page preview cache. Computing a 160-byte preview + UTF-8 decode for
-    /// every visible row every frame dropped UI FPS noticeably; caching the
-    /// strings for as long as the search page doesn't change is O(page_size)
-    /// once and O(1) per frame.
+    /// 每页的预览字符串缓存。搜索结果面板里每行显示一个 160 字节的
+    /// 预览 + UTF-8 解码,不缓存的话每帧要对每行重算一次,可见行一多
+    /// 帧率明显下降。按"页索引 + 查询词"做 cache key,翻页 / 改 query
+    /// 时清掉,不变则沿用。
     search_preview_cache: HashMap<usize, String>,
-    /// Same deal for the "line number" column: `LineIndexer::find_line_at_offset`
-    /// scans up to one checkpoint interval (≤10 MB) in sparse mode, so doing
-    /// it per visible row per frame previously blocked the UI hard enough
-    /// that keystrokes to the Ctrl+F search box stopped registering.
+    /// 同一逻辑适用于"行号"列:`LineIndexer::find_line_at_offset` 在
+    /// 稀疏模式下每次最多要扫一个 checkpoint interval(~10MB),可见
+    /// 行一多就把主线程塞住 —— 之前踩过一次大坑:搜索结果列表每帧
+    /// 对每行调一次,导致 Ctrl+F 搜索框收不到键盘事件(IME 路由被
+    /// 卡住)。缓存进来后热路径 O(1)。
     search_line_cache: HashMap<usize, usize>,
-    /// Identity of the page currently cached — (page_start_index, page_len,
-    /// query string). When any of these differ from the live state we rebuild.
+    /// 上面两个 cache 共用的 key:`(page_start_index, page_len, query)`。
+    /// 三者任一变了就整页清空重建。
     search_preview_cache_key: Option<(usize, usize, String)>,
 }
 
@@ -196,12 +197,12 @@ impl TextViewerApp {
         self.open_file(path);
     }
 
-    /// Sparse-aware wrapper for `LineIndexer::find_line_at_offset`. The
-    /// underlying sparse path needs the raw bytes to scan newlines between
-    /// a checkpoint and the query offset; we always hold them in
-    /// `file_reader` during any code path that operates on byte offsets
-    /// (searching, taint jumping, etc.), so the `expect` below is a
-    /// precondition, not a guess.
+    /// 稀疏索引版本的"字节 offset → 行号"快捷调用。
+    ///
+    /// 底层稀疏路径要用原始字节从最近 checkpoint 扫到目标 offset 数
+    /// `\n`,所以必须带 `&FileReader`。任何处理字节 offset 的代码路径
+    /// (搜索跳转、污点面板双击跳转、Go-To-Line 等)都是在"已有文件"
+    /// 的前提下触发的,所以下面的 `expect` 是前提条件而不是猜测。
     fn line_at(&self, offset: usize) -> usize {
         let reader = self
             .file_reader
@@ -210,19 +211,15 @@ impl TextViewerApp {
         self.line_indexer.find_line_at_offset(offset, reader)
     }
 
-    /// Programmatic jump that lands `target_row` roughly in the middle of
-    /// the viewport instead of at the top. Used by search-result / taint
-    /// hit jumps so the user gets surrounding context without having to
-    /// scroll up.
+    /// 程序化滚动跳转,让 `target_row` 落到视口纵向**中部**而不是顶部。
+    /// 搜索命中 / 污点命中 / Go-To-Line 都走这条路径 —— 目标行带上下文
+    /// 可读性更好,不用再手动往上滚看前几行。
     ///
-    /// Implementation detail: we don't add a new scroll mode — instead we
-    /// subtract half the viewport height from `target_row` up front and
-    /// feed that to the existing top-aligned machinery, including
-    /// `pending_scroll_target` which the correction pass uses to recover
-    /// from f32-precision drift on multi-GB files. `visible_lines` is
-    /// maintained by `render_text_area` each frame (default 50 before the
-    /// first render), so after the first frame it reflects the actual
-    /// viewport size.
+    /// **实现上不加新的滚动模式**:直接把 `target - visible_lines/2` 喂
+    /// 给现有的顶部对齐逻辑(含 `pending_scroll_target` + `scroll_correction`
+    /// 那套 f32 精度漂移补偿,多 GB 文件时关键)。`visible_lines` 由
+    /// `render_text_area` 每帧更新(首帧前默认 50),所以从第二帧开始就是
+    /// 真实视口高度。
     fn scroll_to_row_centered(&mut self, target_row: usize) {
         let half = self.visible_lines.saturating_sub(1) / 2;
         let adjusted = target_row.saturating_sub(half);
@@ -236,14 +233,13 @@ impl TextViewerApp {
         match FileReader::new(path.clone(), self.selected_encoding) {
             Ok(reader) => {
                 self.file_reader = Some(Arc::new(reader));
-                // Kick off exact-line indexing on a background thread so
-                // opening a multi-GB file doesn't block the UI. Queries
-                // fall back to cheap `avg_line_length` estimates until the
-                // scan completes (polled each frame in `update()`).
+                // 后台线程建精确行索引。多 GB 文件也不会卡主线程 ——
+                // 索引完成前的查询走 `avg_line_length` 估算路径,完成后
+                // 由 `update()` 里的 `line_indexer.poll()` 原子切到精确路径。
                 self.line_indexer
                     .index_file_async(self.file_reader.as_ref().unwrap().clone());
                 self.scroll_line = 0;
-                self.scroll_to_row = Some(0); // Reset scroll to top for new file
+                self.scroll_to_row = Some(0); // 新文件从顶部开始
                 self.scroll_correction = 0;
                 self.last_scroll_offset = 0.0;
                 self.pending_scroll_target = None;
@@ -254,10 +250,10 @@ impl TextViewerApp {
                 self.search_page_start_index = 0;
                 self.page_offsets.clear();
                 self.current_result_index = 0;
-                // Caches keyed by byte_offset from the previous file would
-                // otherwise be (quietly) wrong for the new one; the previous
-                // file's taint hits would also keep painting purple lines at
-                // the same byte positions in the new buffer.
+                // 下面这些 cache 和状态都以上一个文件的字节 offset 为 key
+                // 或按字节位置染色,不清掉会跨文件"串场":切新文件后,旧
+                // 文件的污点命中会继续在新文件同字节位置画紫色高亮,搜索
+                // 预览也是旧的内容 —— 看上去像"加载失败"。
                 self.search_preview_cache.clear();
                 self.search_line_cache.clear();
                 self.search_preview_cache_key = None;
@@ -369,14 +365,15 @@ impl TextViewerApp {
 
         if find_all {
             self.search_count_start_time = Some(std::time::Instant::now());
-            // Single parallel pass: each worker thread scans its slice of
-            // the file and reports both its local count (→ CountResult)
-            // and its collected match positions (→ ChunkResult). The UI
-            // poller accumulates counts and sorts ChunkResults by
-            // byte_offset, so results appear in-order the same way the
-            // old sequential `fetch_matches` produced them — just ≈ N×
-            // faster because the I/O happens concurrently across all cores
-            // instead of one thread linearly walking from byte 0.
+            // 单次并行扫(原来是 count 并行 + fetch 串行两趟):每个
+            // worker 线程扫自己那段字节,同时记本地 count(→ CountResult)
+            // 和本地命中位置(→ ChunkResult)。UI 侧的 poller 把 count
+            // 累加,ChunkResult 按 byte_offset 排序,最终呈现顺序与老的
+            // 串行 fetch 完全一致 —— 只是 N 倍更快,因为 I/O 在多核
+            // 并发,不再是单线程从 byte 0 线性走到结尾。
+            //
+            // 之前用户报 "count 秒出 12,结果还要等十几秒才显示" 就是
+            // 因为 fetch 那一趟是单线程。
             let tx_all = tx.clone();
             let reader_all = reader.clone();
             let query = self.search_query.clone();
@@ -676,11 +673,11 @@ impl TextViewerApp {
         let input_path = reader.path().clone();
         let file_size = reader.len();
 
-        // Full-file Replace All copies the entire file to a new one, so for
-        // anything much larger than "normal log" territory the user probably
-        // meant "replace the visible matches" and clicked the wrong button.
-        // 2 GB is a generous threshold; refuse above that with a helpful
-        // message rather than silently starting a 10-minute disk write.
+        // 全量 Replace All 本质是"把整个文件复制一遍写到临时文件,再
+        // 原子 rename 回去"。50GB trace 上这一下磁盘读 + 磁盘写 = 双向
+        // 100GB I/O,不仅要几分钟,还要同等大小的自由空间。用户多半是
+        // 误点(想替换的是当前页里的命中),给个明确阻止优于静默跑十
+        // 分钟。2GB 是一个比较宽松的阈值。
         const REPLACE_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
         if file_size > REPLACE_MAX_BYTES {
             self.status_message = format!(
@@ -1990,14 +1987,13 @@ impl TextViewerApp {
                     });
         };
 
-        // The inner `ScrollArea` is load-bearing, not cosmetic: egui's panel
-        // persists `inner_response.response.rect` as the panel's new size
-        // every frame, so content whose `min_rect` varies (long preview
-        // strings, wide columns, changing row count) would make the panel
-        // oscillate. A ScrollArea's outer rect is driven by its *allocation*
-        // not its inner content (egui `scroll_area.rs:553`), so it cleanly
-        // absorbs those variations. `auto_shrink([false, false])` keeps the
-        // scroll area filling the panel even when content is small.
+        // 内层 `ScrollArea` 是面板宽度稳定的关键,不是样式。
+        // 详见 `src/taint.rs` 对应位置的注释 —— 同一套机制。
+        // 简述:egui SidePanel 的 rect 会被内容 min_rect 反推,内容宽度
+        // 随帧波动(预览字符串长度、列宽变化、行数变化)会让面板抖动,
+        // 连带导致 TextEdit 事件路由间歇失效。ScrollArea 的 outer rect
+        // 由 allocation 而非 content 决定,正好截断这条传播链。
+        // `auto_shrink([false, false])` 防止内容少时反向缩小。
         match self.search_list_dock {
             DockSide::Right => {
                 egui::SidePanel::right("search_list_right")
@@ -2147,11 +2143,11 @@ impl eframe::App for TextViewerApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
-        // Drain the async indexer's result channel. While a scan is in
-        // flight queries fall back to estimates, so we want to land the
-        // exact data as soon as it's available; `poll` is O(1) per call
-        // and returning true means the exact index just arrived → repaint
-        // once to refresh any cached row numbers in the visible panels.
+        // 推进后台异步索引:把 worker 线程发来的消息吃掉。
+        // 建索引期间查询走估算路径,所以希望 Exact 消息一到就切精确
+        // 模式。`poll()` 本身 O(1),返回 true 意味着 Exact 本帧刚到
+        // → 重绘一次刷新可见面板里的行号缓存。`is_indexing()` 为 true
+        // 时 100ms 请求一次重绘,不至于漏掉 Exact 的到达。
         if self.line_indexer.poll() {
             ctx.request_repaint();
         } else if self.line_indexer.is_indexing() {

@@ -5,24 +5,32 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 
-/// One entry in the sparse checkpoint table used by large files.
+/// 大文件稀疏索引里的一个 checkpoint。
 ///
-/// The invariant is that `byte_pos` is the **start of a line** — it either
-/// equals `0` or points immediately after a `\n`. `line_index` is the
-/// zero-based number of that line in the whole file. Keeping checkpoints on
-/// line boundaries lets a query answer an exact line ↔ byte mapping by
-/// scanning at most one checkpoint's worth of bytes.
+/// **不变式**:`byte_pos` 必须是某一行的**起点**(等于 0,或紧跟在某个
+/// `\n` 之后)。`line_index` 是该行在整个文件中的 0-based 行号。只要
+/// checkpoint 都落在行边界上,查询时从最近的 checkpoint 扫至多一个
+/// interval 的字节就能精确回答"字节 offset ↔ 行号"的映射 —— 这是
+/// "主视图行号"和"污点面板行号"能对齐的关键(历史上出现过稀疏模式
+/// 下两边行号差几十行的 bug)。
 #[derive(Clone, Copy, Debug)]
 struct SparseCheckpoint {
     byte_pos: usize,
     line_index: usize,
 }
 
-/// Messages the background scan worker posts back to the main thread. A
-/// Seed is delivered first (after a cheap 10 MB sample) so estimates snap
-/// from "rough file_size/80" to "based on this file's actual line density"
-/// without blocking the UI on disk I/O; the Exact message follows once
-/// the full scan completes.
+/// 后台扫描 worker 回传给主线程的消息。
+///
+/// 两阶段推送:
+/// - `Seed`:10MB 采样结束后立刻发,把估算从"file_size / 80 的粗估"
+///   升级到"根据本文件真实行密度估算"。用于让 UI 首帧响应后的短时间
+///   内(全扫还没结束时)行数/滚动位置看起来更合理。
+/// - `Exact`:整个文件扫完后发,带完整的 checkpoint 列表和精确行数。
+///   主线程此时切到精确查询模式(`exact_ready = true`)。
+///
+/// 之前同步做 Seed 采样时,冷磁盘上第一次 touch 10MB 会触发 page
+/// fault(SATA SSD ~300ms,HDD ~1s),拖放 50GB 文件会卡一下才加载。
+/// 把 Seed 也挪到后台线程后,主线程从 `index_file_async` 返回 <1ms。
 enum IndexMsg {
     Seed {
         avg_line_length: f64,
@@ -34,8 +42,8 @@ enum IndexMsg {
     },
 }
 
-/// Live background scan. Dropping the indexer or starting a new scan flips
-/// `cancel` so the worker thread exits on its next cancellation check.
+/// 正在跑的后台扫描句柄。LineIndexer 被 drop 或开启新扫描时,把
+/// `cancel` 置 true,worker 线程在下一次 cancel 检查时退出。
 struct PendingExactIndex {
     rx: Receiver<IndexMsg>,
     cancel: Arc<AtomicBool>,
@@ -83,10 +91,9 @@ impl LineIndexer {
         }
     }
 
-    /// Synchronous indexing. Blocks until the exact line index is ready,
-    /// so queries immediately afterwards return exact answers. Fine for
-    /// small files and for tests; in a GUI, prefer `index_file_async` so
-    /// the UI thread stays responsive while a multi-GB file gets scanned.
+    /// 同步建索引。函数返回时"精确行号"已就绪,后续查询直接拿精确
+    /// 结果。适合小文件和测试用;GUI 里要用 `index_file_async`,否则
+    /// 几 GB 文件会把主线程卡住几秒。
     pub fn index_file(&mut self, reader: &FileReader) {
         self.abort_pending();
         self.reset_for_new_file(reader.len());
@@ -114,18 +121,18 @@ impl LineIndexer {
         self.indexed = true;
     }
 
-    /// Non-blocking indexing. Returns immediately after seeding a cheap
-    /// `avg_line_length` estimate (from the first 10 MB) so the UI is
-    /// usable right away. The actual checkpoint scan runs on a background
-    /// thread; call `poll` each frame from the UI loop to integrate the
-    /// result once it's ready.
+    /// 非阻塞建索引。函数立刻返回(仅设置一个 file_size/80 的粗估
+    /// `avg_line_length`),真正的 10MB 采样和全文件 `\n` 扫描都在
+    /// 后台线程里做。主线程每帧调 `poll()` 吃消息把结果合进来。
     ///
-    /// While the background scan is in flight, queries fall back to
-    /// estimation via `avg_line_length`. Those answers are good enough
-    /// for scrolling and for first-approximation row labels; anything
-    /// that needs exact numbers (taint jump landing line, Go-To-Line,
-    /// precise search-result row) will snap into place once the exact
-    /// index lands.
+    /// 索引未完成时,查询走 `avg_line_length` 估算路径 —— 够用于滚动
+    /// 和粗略行号展示。一旦 `Exact` 消息到达,需要精确数字的场景
+    /// (污点命中跳转行号、Go-To-Line 定位、搜索结果行号)自动切到
+    /// 精确模式,无需调用方介入。
+    ///
+    /// 之所以把 10MB 采样也放到后台:冷磁盘首次 touch 10MB 会触发
+    /// page fault,SATA SSD 约 300ms / HDD 约 1s,拖放 50GB 文件
+    /// 主线程会卡一下"白一下"才渲染。放后台后主线程 <1ms 返回。
     pub fn index_file_async(&mut self, reader: Arc<FileReader>) {
         self.abort_pending();
         self.reset_for_new_file(reader.len());
@@ -133,8 +140,8 @@ impl LineIndexer {
         const FULL_INDEX_THRESHOLD: usize = 10_000_000;
 
         if self.file_size <= FULL_INDEX_THRESHOLD {
-            // Full index is cheap — just do it synchronously and avoid the
-            // ceremony of a worker thread for tens of milliseconds of work.
+            // 小文件直接同步建全量索引:≤10MB 的 memchr 扫 \n 几毫秒
+            // 就完事了,起个 worker 线程的开销反而更大。
             self.full_index(reader.all_data());
             self.sample_interval = 0;
             self.total_lines = self.line_offsets.len();
@@ -143,11 +150,10 @@ impl LineIndexer {
         }
 
         self.sample_interval = SPARSE_CHECKPOINT_INTERVAL;
-        // Cheap-as-it-gets initial estimate so the UI has *something* to
-        // show this very frame: average ASCII log lines run ~80 bytes,
-        // so file_size/80 is in the right order of magnitude. The Seed
-        // message arriving milliseconds later refines it from real bytes;
-        // the Exact message replaces it with the precise count.
+        // 把能立刻设的最粗估算先设上,让 UI 这一帧就有"行数""avg"等
+        // 字段可用(哪怕不准)。常见 ASCII 日志行 ~80 字节,file_size/80
+        // 作为数量级对了就行。几百毫秒后 Seed 消息到达会刷新为实测的
+        // 10MB 平均值;几秒后 Exact 消息到达再替换为精确总行数。
         self.avg_line_length = 80.0;
         self.total_lines = self.file_size / 80;
 
@@ -157,11 +163,10 @@ impl LineIndexer {
         let reader_for_worker = reader;
 
         thread::spawn(move || {
-            // Phase 1: 10 MB sample → real avg_line_length. This touches
-            // pages that may not be in OS cache yet (slow on cold-disk),
-            // but doing it here instead of on the UI thread is the
-            // difference between "drag-drop freezes for 300 ms" and
-            // "drag-drop responds instantly".
+            // Phase 1:10MB 采样得到真实 avg_line_length。
+            // 冷磁盘下这 10MB 首次 touch 会 page fault 从磁盘读,
+            // SATA SSD ~300ms,HDD 能到 1s。放后台线程做,主线程
+            // 的"拖放响应"就不会被这段 I/O 卡住。
             const SEED_WINDOW: usize = 10_000_000;
             let bytes_all = reader_for_worker.all_data();
             let seed_end = SEED_WINDOW.min(bytes_all.len());
@@ -180,12 +185,12 @@ impl LineIndexer {
                 return;
             }
 
-            // Phase 2: full scan → exact checkpoints + total.
+            // Phase 2:全量扫 → 精确 checkpoints + 总行数。
             if let Some((checkpoints, total_lines)) =
                 sparse_scan_for_exact_index(bytes_all, SPARSE_CHECKPOINT_INTERVAL, &cancel_for_worker)
             {
-                // SendError on a dropped receiver means the indexer moved on
-                // (new file, shutdown) — silently ignore.
+                // 接收端被 drop(换文件 / 退出 app)时 send 会 Err,
+                // 无声忽略即可 —— 对端不再关心结果。
                 let _ = tx.send(IndexMsg::Exact {
                     checkpoints,
                     total_lines,
@@ -194,13 +199,12 @@ impl LineIndexer {
         });
 
         self.pending = Some(PendingExactIndex { rx, cancel });
-        self.indexed = true; // estimates are already usable
+        self.indexed = true; // 估算值本帧已可用
     }
 
-    /// Drive async indexing forward. Returns `true` iff the **final** exact
-    /// result landed this call (useful to trigger a UI repaint / cache
-    /// invalidation). Intermediate `Seed` messages return `false` — they
-    /// refine estimates but don't flip `exact_ready`.
+    /// 推进后台异步索引。当"最终精确结果"(Exact 消息)本次调用落地时
+    /// 返回 `true`,调用方可据此触发 UI 重绘 / 缓存失效。中间的 Seed
+    /// 消息只是 refine 估算,不翻 `exact_ready`,返回 `false`。
     pub fn poll(&mut self) -> bool {
         let mut exact_landed = false;
         loop {
@@ -212,9 +216,9 @@ impl LineIndexer {
                     avg_line_length,
                     total_lines_estimate,
                 }) => {
-                    // Keep the estimate improving — user sees row counts
-                    // converge from "file_size/80" to "actual density"
-                    // before the full scan completes.
+                    // Seed 阶段只刷估算:用户看到行数从"file_size/80
+                    // 粗估"→"本文件真实行密度估算"→(Exact 到达后)
+                    // "精确行数" 三段收敛。
                     self.avg_line_length = avg_line_length;
                     self.total_lines = total_lines_estimate;
                 }
@@ -228,8 +232,8 @@ impl LineIndexer {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Worker exited (cancelled, panicked, or already sent
-                    // the final message and dropped its sender).
+                    // Worker 退出了(cancelled / panic / 已发完消息
+                    // 并 drop sender)。清掉 pending 让后续查询别等了。
                     self.pending = None;
                     break;
                 }
@@ -238,8 +242,8 @@ impl LineIndexer {
         exact_landed
     }
 
-    /// True while the background exact-index scan hasn't delivered yet.
-    /// The UI can show an "indexing…" hint while this is true.
+    /// 后台精确索引还没 ready 就返回 true。UI 可据此显示"建索引中"
+    /// 提示 + `~N` 前缀标识总行数是估算值。
     pub fn is_indexing(&self) -> bool {
         self.pending.is_some()
     }
@@ -288,8 +292,8 @@ impl LineIndexer {
     }
 
     fn full_index(&mut self, data: &[u8]) {
-        // memchr's SIMD scan is ~5–10× faster than the naive `iter().filter`
-        // loop on large inputs; even the 10 MB full-index path benefits.
+        // memchr 的 SIMD(AVX2 / SSE2)扫描比 `iter().filter` 裸循环
+        // 快 5-10 倍。即便是 ≤10MB 的全量索引路径也受益。
         for pos in memchr_iter(b'\n', data) {
             self.line_offsets.push(pos + 1);
         }
@@ -315,10 +319,12 @@ impl LineIndexer {
         }
     }
 
-    /// Resolve `line_num` (0-based) to its exact `[start, end)` byte range
-    /// when the exact index is ready. Falls back to an estimate (same math
-    /// as the old pre-0.29 implementation) while the background scan is
-    /// still running.
+    /// 把 0-based 的 `line_num` 解析到它精确的 `[start, end)` 字节区间。
+    /// 稀疏模式下 exact_ready 前走估算路径,到达后走 checkpoint 扫描
+    /// 路径(精确)。
+    ///
+    /// 精确路径是解决"主视图行号和污点面板行号对不齐"的关键:主视图
+    /// 拿行号查字节,污点面板拿字节查行号,两侧都走精确路径才能对上。
     pub fn get_line_with_reader(
         &self,
         line_num: usize,
@@ -424,9 +430,9 @@ impl LineIndexer {
         }
 
         if !self.exact_ready {
-            // Fallback estimate: offset / avg_line_length. Off by a few dozen
-            // rows near EOF on multi-GB files but good enough for UI state
-            // while the exact index is still being built.
+            // 精确索引还没到,退化到估算:offset / avg_line_length。
+            // 在多 GB 文件靠近末尾的位置会偏几十行,但仅作 UI 状态
+            // 占位用,Exact 到达后会自动切回精确路径。
             if self.avg_line_length <= 0.0 {
                 return offset / 80;
             }
@@ -463,11 +469,10 @@ impl Drop for LineIndexer {
 
 const SPARSE_CHECKPOINT_INTERVAL: usize = 10_000_000; // 10 MB
 
-/// Walk the whole file once counting `\n` bytes (SIMD-accelerated via
-/// `memchr`) and drop a line-aligned checkpoint each time we cross an
-/// `interval`-byte boundary. O(file_size) memory bandwidth with negligible
-/// allocation; cancellation is checked every 1 MB of newlines so a user
-/// opening a new file promptly aborts the previous scan.
+/// 把整个文件走一遍,用 memchr(SIMD)数 `\n`,每跨过一个
+/// `interval` 字节边界就在下一个行起点落一个 checkpoint。总体 O(file_size)
+/// 内存带宽,几乎不分配堆。每数满 2^20 个 `\n` 检查一次 cancel 标志,
+/// 换文件时上一次扫描能及时退出。
 fn sparse_scan_for_exact_index(
     bytes: &[u8],
     interval: usize,
