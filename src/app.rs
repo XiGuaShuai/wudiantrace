@@ -236,10 +236,17 @@ impl TextViewerApp {
         match FileReader::new(path.clone(), self.selected_encoding) {
             Ok(reader) => {
                 self.file_reader = Some(Arc::new(reader));
+                // Kick off exact-line indexing on a background thread so
+                // opening a multi-GB file doesn't block the UI. Queries
+                // fall back to cheap `avg_line_length` estimates until the
+                // scan completes (polled each frame in `update()`).
                 self.line_indexer
-                    .index_file(self.file_reader.as_ref().unwrap());
+                    .index_file_async(self.file_reader.as_ref().unwrap().clone());
                 self.scroll_line = 0;
                 self.scroll_to_row = Some(0); // Reset scroll to top for new file
+                self.scroll_correction = 0;
+                self.last_scroll_offset = 0.0;
+                self.pending_scroll_target = None;
                 self.status_message = format!("Opened: {}", path.display());
                 self.search_engine.clear();
                 self.search_results.clear();
@@ -247,6 +254,15 @@ impl TextViewerApp {
                 self.search_page_start_index = 0;
                 self.page_offsets.clear();
                 self.current_result_index = 0;
+                // Caches keyed by byte_offset from the previous file would
+                // otherwise be (quietly) wrong for the new one; the previous
+                // file's taint hits would also keep painting purple lines at
+                // the same byte positions in the new buffer.
+                self.search_preview_cache.clear();
+                self.search_line_cache.clear();
+                self.search_preview_cache_key = None;
+                self.taint.clear_results();
+                self.pending_replacements.clear();
 
                 // Setup file watcher if tail mode is enabled
                 if self.tail_mode {
@@ -667,6 +683,24 @@ impl TextViewerApp {
             return;
         };
         let input_path = reader.path().clone();
+        let file_size = reader.len();
+
+        // Full-file Replace All copies the entire file to a new one, so for
+        // anything much larger than "normal log" territory the user probably
+        // meant "replace the visible matches" and clicked the wrong button.
+        // 2 GB is a generous threshold; refuse above that with a helpful
+        // message rather than silently starting a 10-minute disk write.
+        const REPLACE_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+        if file_size > REPLACE_MAX_BYTES {
+            self.status_message = format!(
+                "Replace All 禁用:文件 {:.1} GB 超过 {} GB 阈值。\
+                 全量替换要把整个文件复制一遍,50GB 级 trace 文件上基本\
+                 不可用,也不是此工具的设计目标。",
+                file_size as f64 / 1024.0 / 1024.0 / 1024.0,
+                REPLACE_MAX_BYTES / 1024 / 1024 / 1024
+            );
+            return;
+        }
 
         // Ask for output file
         if let Some(output_path) = rfd::FileDialog::new()
@@ -1125,7 +1159,28 @@ impl TextViewerApp {
                     ui.separator();
                     ui.label(format!("Size: {} bytes", reader.len()));
                     ui.separator();
-                    ui.label(format!("Lines: ~{}", self.line_indexer.total_lines()));
+                    // `~` while the background exact-index scan is running
+                    // — the count is an avg-line-length estimate during
+                    // that window. Once `poll` lands the scan result, the
+                    // same code path prints the exact total.
+                    let line_prefix = if self.line_indexer.is_indexing() {
+                        "~"
+                    } else {
+                        ""
+                    };
+                    ui.label(format!(
+                        "Lines: {}{}",
+                        line_prefix,
+                        self.line_indexer.total_lines()
+                    ));
+                    if self.line_indexer.is_indexing() {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        ui.label(
+                            egui::RichText::new("建索引中")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(200, 180, 120)),
+                        );
+                    }
                     ui.separator();
                     ui.label(format!("Encoding: {}", reader.encoding().name()));
                     ui.separator();
@@ -2099,6 +2154,17 @@ impl eframe::App for TextViewerApp {
             // 60 fps repaint loop while a background job runs eats CPU and
             // makes every other widget feel sluggish.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // Drain the async indexer's result channel. While a scan is in
+        // flight queries fall back to estimates, so we want to land the
+        // exact data as soon as it's available; `poll` is O(1) per call
+        // and returning true means the exact index just arrived → repaint
+        // once to refresh any cached row numbers in the visible panels.
+        if self.line_indexer.poll() {
+            ctx.request_repaint();
+        } else if self.line_indexer.is_indexing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         if self.search_in_progress || self.replace_in_progress {

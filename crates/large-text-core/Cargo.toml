@@ -12,6 +12,7 @@ categories = ["text-processing"]
 anyhow = "1.0"
 encoding_rs = "0.8"
 memmap2 = "0.9"
+memchr = "2.7"
 regex = "1.10"
 
 [dev-dependencies]

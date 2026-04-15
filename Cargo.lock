@@ -1797,6 +1797,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "encoding_rs",
+ "memchr",
  "memmap2",
  "regex",
  "tempfile",
