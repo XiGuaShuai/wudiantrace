@@ -1,6 +1,6 @@
 //! Taint propagation engine — direct port of TaintEngine.{h,cpp}.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -53,6 +53,16 @@ pub struct ResultEntry {
     pub mem_snapshot: HashSet<u64>,
 }
 
+/// 内存值不匹配：Store 写入的值和 Load 读出的值不一致，
+/// 说明中间有 trace 未覆盖的写入。
+#[derive(Clone, Debug)]
+pub struct ValueMismatch {
+    pub index: usize,
+    pub mem_addr: u64,
+    pub expected_val: u64,
+    pub actual_val: u64,
+}
+
 pub struct TaintEngine {
     mode: TrackMode,
     source: TaintSource,
@@ -61,8 +71,9 @@ pub struct TaintEngine {
 
     reg_taint: [bool; 256],
     tainted_reg_count: i32,
-    tainted_mem: HashSet<u64>,
+    tainted_mem: HashMap<u64, Option<u64>>,
     results: Vec<ResultEntry>,
+    mismatches: Vec<ValueMismatch>,
     stop_reason: StopReason,
     /// 上次 `run()` 的起点在 parser.lines() 里的下标。`None` 表示从未
     /// 调用过 run()。`format_result` 里会根据这个字段在日志 header
@@ -101,8 +112,9 @@ impl TaintEngine {
             cancel: None,
             reg_taint: [false; 256],
             tainted_reg_count: 0,
-            tainted_mem: HashSet::new(),
+            tainted_mem: HashMap::new(),
             results: Vec::new(),
+            mismatches: Vec::new(),
             stop_reason: StopReason::EndOfTrace,
             start_index: None,
             remaining_taint_at_boundary: None,
@@ -138,16 +150,21 @@ impl TaintEngine {
         self.source
     }
 
+    pub fn mismatches(&self) -> &[ValueMismatch] {
+        &self.mismatches
+    }
+
     pub fn set_source(&mut self, source: TaintSource) {
         self.source = source;
         self.reg_taint = [false; 256];
         self.tainted_reg_count = 0;
         self.tainted_mem.clear();
         self.results.clear();
+        self.mismatches.clear();
         self.stop_reason = StopReason::EndOfTrace;
 
         if source.is_mem {
-            self.tainted_mem.insert(source.mem_addr);
+            self.tainted_mem.insert(source.mem_addr, None);
         } else {
             self.taint_reg(source.reg);
         }
@@ -191,10 +208,10 @@ impl TaintEngine {
                 return true;
             }
         }
-        if line.has_mem_read && self.tainted_mem.contains(&line.mem_read_addr) {
+        if line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr) {
             return true;
         }
-        if line.has_mem_read2 && self.tainted_mem.contains(&line.mem_read_addr2) {
+        if line.has_mem_read2 && self.tainted_mem.contains_key(&line.mem_read_addr2) {
             return true;
         }
         false
@@ -206,10 +223,10 @@ impl TaintEngine {
                 return true;
             }
         }
-        if line.has_mem_write && self.tainted_mem.contains(&line.mem_write_addr) {
+        if line.has_mem_write && self.tainted_mem.contains_key(&line.mem_write_addr) {
             return true;
         }
-        if line.has_mem_write2 && self.tainted_mem.contains(&line.mem_write_addr2) {
+        if line.has_mem_write2 && self.tainted_mem.contains_key(&line.mem_write_addr2) {
             return true;
         }
         false
@@ -219,11 +236,56 @@ impl TaintEngine {
         self.results.push(ResultEntry {
             index,
             reg_snapshot: self.reg_taint,
-            mem_snapshot: self.tainted_mem.clone(),
+            mem_snapshot: self.tainted_mem.keys().copied().collect(),
         });
     }
 
-    fn propagate_forward(&mut self, line: &TraceLine) {
+    /// ARM64 caller-saved 寄存器:x0-x18 + NZCV。外部函数调用后
+    /// 这些全部可能被覆盖。
+    fn untaint_caller_saved(&mut self) {
+        for reg_id in 0..=18u8 {
+            self.untaint_reg(reg_id); // x0-x18
+        }
+        self.untaint_reg(REG_NZCV);
+    }
+
+    /// caller-saved 里有没有 tainted 的(用于 ExternalCall 参与判断)。
+    fn any_caller_saved_tainted(&self) -> bool {
+        for reg_id in 0..=18u8 {
+            if self.is_reg_tainted(reg_id) {
+                return true;
+            }
+        }
+        self.is_reg_tainted(REG_NZCV)
+    }
+
+    fn check_mem_read_mismatch(&mut self, addr: u64, actual_val: u64, index: usize) {
+        if let Some(&Some(expected)) = self.tainted_mem.get(&addr) {
+            if expected != actual_val {
+                self.mismatches.push(ValueMismatch {
+                    index,
+                    mem_addr: addr,
+                    expected_val: expected,
+                    actual_val,
+                });
+            }
+        }
+    }
+
+    fn check_mem_write_mismatch(&mut self, addr: u64, actual_val: u64, index: usize) {
+        if let Some(&Some(expected)) = self.tainted_mem.get(&addr) {
+            if expected != actual_val {
+                self.mismatches.push(ValueMismatch {
+                    index,
+                    mem_addr: addr,
+                    expected_val: expected,
+                    actual_val,
+                });
+            }
+        }
+    }
+
+    fn propagate_forward(&mut self, line: &TraceLine, index: usize) {
         use InsnCategory::*;
         match line.category {
             ImmLoad => {
@@ -231,9 +293,10 @@ impl TaintEngine {
                     self.untaint_reg(line.dst_regs[i]);
                 }
             }
-            PartialModify => {
-                // movk preserves existing taint
+            ExternalCall => {
+                self.untaint_caller_saved();
             }
+            PartialModify => {}
             DataMove | Arithmetic | Logic | ShiftExt | Bitfield | CondSelect => {
                 let src_t = self.any_src_tainted(line);
                 for i in 0..line.num_dst as usize {
@@ -254,21 +317,26 @@ impl TaintEngine {
             Load => {
                 if line.has_mem_read2 && line.num_dst >= 2 {
                     let mem_t1 =
-                        line.has_mem_read && self.tainted_mem.contains(&line.mem_read_addr);
-                    let mem_t2 = self.tainted_mem.contains(&line.mem_read_addr2);
+                        line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
+                    let mem_t2 = self.tainted_mem.contains_key(&line.mem_read_addr2);
                     if mem_t1 {
+                        self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
                         self.taint_reg(line.dst_regs[0]);
                     } else {
                         self.untaint_reg(line.dst_regs[0]);
                     }
                     if mem_t2 {
+                        self.check_mem_read_mismatch(line.mem_read_addr2, line.mem_read_val2, index);
                         self.taint_reg(line.dst_regs[1]);
                     } else {
                         self.untaint_reg(line.dst_regs[1]);
                     }
                 } else {
                     let mem_t =
-                        line.has_mem_read && self.tainted_mem.contains(&line.mem_read_addr);
+                        line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
+                    if mem_t {
+                        self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
+                    }
                     for i in 0..line.num_dst as usize {
                         if mem_t {
                             self.taint_reg(line.dst_regs[i]);
@@ -282,12 +350,12 @@ impl TaintEngine {
                 if line.has_mem_write {
                     if line.has_mem_write2 && line.num_src >= 2 {
                         if self.is_reg_tainted(line.src_regs[0]) {
-                            self.tainted_mem.insert(line.mem_write_addr);
+                            self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
                         } else {
                             self.tainted_mem.remove(&line.mem_write_addr);
                         }
                         if self.is_reg_tainted(line.src_regs[1]) {
-                            self.tainted_mem.insert(line.mem_write_addr2);
+                            self.tainted_mem.insert(line.mem_write_addr2, Some(line.mem_write_val2));
                         } else {
                             self.tainted_mem.remove(&line.mem_write_addr2);
                         }
@@ -295,7 +363,7 @@ impl TaintEngine {
                         let src_t =
                             line.num_src > 0 && self.is_reg_tainted(line.src_regs[0]);
                         if src_t {
-                            self.tainted_mem.insert(line.mem_write_addr);
+                            self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
                         } else {
                             self.tainted_mem.remove(&line.mem_write_addr);
                         }
@@ -322,7 +390,7 @@ impl TaintEngine {
                 }
                 if line.has_mem_write {
                     if src_t {
-                        self.tainted_mem.insert(line.mem_write_addr);
+                        self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
                     } else {
                         self.tainted_mem.remove(&line.mem_write_addr);
                     }
@@ -331,9 +399,12 @@ impl TaintEngine {
         }
     }
 
-    fn propagate_backward(&mut self, line: &TraceLine) {
+    fn propagate_backward(&mut self, line: &TraceLine, index: usize) {
         use InsnCategory::*;
         match line.category {
+            ExternalCall => {
+                self.untaint_caller_saved();
+            }
             ImmLoad => {
                 for i in 0..line.num_dst as usize {
                     if self.is_reg_tainted(line.dst_regs[i]) {
@@ -364,12 +435,12 @@ impl TaintEngine {
                     if t0 {
                         self.untaint_reg(line.dst_regs[0]);
                         if line.has_mem_read {
-                            self.tainted_mem.insert(line.mem_read_addr);
+                            self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
                         }
                     }
                     if t1 {
                         self.untaint_reg(line.dst_regs[1]);
-                        self.tainted_mem.insert(line.mem_read_addr2);
+                        self.tainted_mem.insert(line.mem_read_addr2, Some(line.mem_read_val2));
                     }
                 } else {
                     let mut dst_t = false;
@@ -380,22 +451,25 @@ impl TaintEngine {
                         }
                     }
                     if dst_t && line.has_mem_read {
-                        self.tainted_mem.insert(line.mem_read_addr);
+                        self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
                     }
                 }
             }
             Store => {
                 if line.has_mem_write {
                     if line.has_mem_write2 && line.num_src >= 2 {
-                        if self.tainted_mem.contains(&line.mem_write_addr) {
+                        if self.tainted_mem.contains_key(&line.mem_write_addr) {
+                            self.check_mem_write_mismatch(line.mem_write_addr, line.mem_write_val, index);
                             self.tainted_mem.remove(&line.mem_write_addr);
                             self.taint_reg(line.src_regs[0]);
                         }
-                        if self.tainted_mem.contains(&line.mem_write_addr2) {
+                        if self.tainted_mem.contains_key(&line.mem_write_addr2) {
+                            self.check_mem_write_mismatch(line.mem_write_addr2, line.mem_write_val2, index);
                             self.tainted_mem.remove(&line.mem_write_addr2);
                             self.taint_reg(line.src_regs[1]);
                         }
-                    } else if self.tainted_mem.contains(&line.mem_write_addr) {
+                    } else if self.tainted_mem.contains_key(&line.mem_write_addr) {
+                        self.check_mem_write_mismatch(line.mem_write_addr, line.mem_write_val, index);
                         self.tainted_mem.remove(&line.mem_write_addr);
                         if line.num_src > 0 {
                             self.taint_reg(line.src_regs[0]);
@@ -422,7 +496,7 @@ impl TaintEngine {
                         self.taint_reg(line.src_regs[i]);
                     }
                     if line.has_mem_read {
-                        self.tainted_mem.insert(line.mem_read_addr);
+                        self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
                     }
                 }
             }
@@ -431,6 +505,7 @@ impl TaintEngine {
 
     pub fn run(&mut self, lines: &[TraceLine], start_index: usize) {
         self.results.clear();
+        self.mismatches.clear();
         self.stop_reason = StopReason::EndOfTrace;
         self.start_index = None;
         self.remaining_taint_at_boundary = None;
@@ -452,18 +527,24 @@ impl TaintEngine {
                     let line = &lines[i].clone();
                     let mut involved = self.any_src_tainted(line);
                     if !involved
+                        && line.category == InsnCategory::ExternalCall
+                        && self.any_caller_saved_tainted()
+                    {
+                        involved = true;
+                    }
+                    if !involved
                         && line.has_mem_write
-                        && self.tainted_mem.contains(&line.mem_write_addr)
+                        && self.tainted_mem.contains_key(&line.mem_write_addr)
                     {
                         involved = true;
                     }
                     if !involved
                         && line.has_mem_write2
-                        && self.tainted_mem.contains(&line.mem_write_addr2)
+                        && self.tainted_mem.contains_key(&line.mem_write_addr2)
                     {
                         involved = true;
                     }
-                    self.propagate_forward(line);
+                    self.propagate_forward(line, i);
                     if involved {
                         self.record(i);
                         idle = 0;
@@ -483,28 +564,33 @@ impl TaintEngine {
             }
             TrackMode::Backward => {
                 let start_line = lines[start_index].clone();
-                self.propagate_backward(&start_line);
+                self.propagate_backward(&start_line, start_index);
                 self.record(start_index);
                 let mut idle: u32 = 0;
                 let mut i = start_index as isize - 1;
                 while i >= 0 {
                     if self.is_cancelled() {
                         self.stop_reason = StopReason::Cancelled;
-                        // reverse to chronological
                         self.results.reverse();
                         return;
                     }
                     let line = &lines[i as usize].clone();
                     let mut involved = self.any_dst_tainted(line);
                     if !involved
+                        && line.category == InsnCategory::ExternalCall
+                        && self.any_caller_saved_tainted()
+                    {
+                        involved = true;
+                    }
+                    if !involved
                         && line.has_mem_write
-                        && self.tainted_mem.contains(&line.mem_write_addr)
+                        && self.tainted_mem.contains_key(&line.mem_write_addr)
                     {
                         involved = true;
                     }
                     if !involved
                         && line.has_mem_write2
-                        && self.tainted_mem.contains(&line.mem_write_addr2)
+                        && self.tainted_mem.contains_key(&line.mem_write_addr2)
                     {
                         involved = true;
                     }
@@ -512,7 +598,7 @@ impl TaintEngine {
                         involved = true;
                     }
                     if involved {
-                        self.propagate_backward(line);
+                        self.propagate_backward(line, i as usize);
                         self.record(i as usize);
                         idle = 0;
                     } else {
@@ -529,10 +615,6 @@ impl TaintEngine {
                     i -= 1;
                 }
                 self.results.reverse();
-                // 反向追踪结束后,如果 taint 集仍非空(没有
-                // AllTaintCleared),说明这些值的来源在 trace 覆盖
-                // 范围之前 —— 典型场景:函数入参、全局变量、
-                // hook 前的寄存器状态。记录下来供 UI 展示。
                 if self.tainted_reg_count > 0 || !self.tainted_mem.is_empty() {
                     let mut regs = Vec::new();
                     for i in 0..256u16 {
@@ -540,7 +622,7 @@ impl TaintEngine {
                             regs.push(reg_name(i as u8).to_string());
                         }
                     }
-                    let mut mems: Vec<u64> = self.tainted_mem.iter().copied().collect();
+                    let mut mems: Vec<u64> = self.tainted_mem.keys().copied().collect();
                     mems.sort_unstable();
                     self.remaining_taint_at_boundary = Some(RemainingTaint { regs, mems });
                 }
@@ -626,6 +708,20 @@ impl TaintEngine {
                 out.push_str(&format!(
                     "  → 这些值是函数 {} 的入参/初始状态,由调用方(LR={})传入\n",
                     func_id, lr
+                ));
+            }
+        }
+
+        if !self.mismatches.is_empty() {
+            out.push_str(&format!(
+                "⚠ 发现 {} 处内存值不匹配(中间可能有 trace 未覆盖的写入):\n",
+                self.mismatches.len()
+            ));
+            for mm in &self.mismatches {
+                let tl = &lines[mm.index];
+                out.push_str(&format!(
+                    "  line {} mem:0x{:x}: 期望 0x{:x}, 实际 0x{:x}\n",
+                    tl.line_number, mm.mem_addr, mm.expected_val, mm.actual_val
                 ));
             }
         }

@@ -120,7 +120,7 @@ fn validate_results(
 
 /// 对一个采样点内的某条指令跑 Backward + Forward + 内存追踪。
 fn test_instruction(
-    bytes: &[u8],
+    _bytes: &[u8],
     lines: &[large_text_taint::trace::TraceLine],
     insn_idx: usize,
 ) {

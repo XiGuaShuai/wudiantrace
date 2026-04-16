@@ -16,6 +16,10 @@ pub enum InsnCategory {
     Compare,       // cmp, cmn, tst
     CondSelect,    // csel, csinc, csinv, csneg
     Branch,        // b, bl, blr, br, ret, cbz, ...
+    /// 外部函数调用(未 trace 内部)。由 parser 从 `-> libc.so!malloc(...)`
+    /// 这类行合成。ARM64 调用约定下 x0-x18 + NZCV 全部被调用方覆盖,
+    /// engine 据此切断 taint 传播链。
+    ExternalCall,
     Other,
 }
 
@@ -33,6 +37,10 @@ pub struct TraceLine {
     pub mem_write_addr: u64,
     pub mem_write_addr2: u64, // STP second write
     pub mem_read_addr2: u64,  // LDP second read
+    pub mem_read_val: u64,
+    pub mem_write_val: u64,
+    pub mem_read_val2: u64,
+    pub mem_write_val2: u64,
     pub rel_addr: u64,
     pub has_mem_read: bool,
     pub has_mem_write: bool,
@@ -64,6 +72,10 @@ impl Default for TraceLine {
             mem_write_addr: 0,
             mem_write_addr2: 0,
             mem_read_addr2: 0,
+            mem_read_val: 0,
+            mem_write_val: 0,
+            mem_read_val2: 0,
+            mem_write_val2: 0,
             rel_addr: 0,
             has_mem_read: false,
             has_mem_write: false,

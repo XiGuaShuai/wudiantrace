@@ -43,8 +43,66 @@ fn is_instruction_line(buf: &[u8]) -> bool {
     false
 }
 
-/// Standalone `MEM R/W 0x<addr> [N bytes]: ...` line. Returns (rw, addr).
-fn parse_mem_line(buf: &[u8]) -> Option<(u8, u64)> {
+/// `-> libc.so!malloc(1440) ret: 0x78d7d22d20` 或 `-> libc.so!free`
+/// 形式的外部函数调用行。xgtrace 用 `->` 前缀标记"跳到了一个未
+/// trace 的外部函数",后面可能带参数和返回值。
+fn is_external_call_line(buf: &[u8]) -> bool {
+    // 最短形式: "-> x" = 4 bytes
+    if buf.len() < 4 {
+        return false;
+    }
+    // 跳过行首空格
+    let trimmed = match buf.iter().position(|&b| b != b' ' && b != b'\t') {
+        Some(p) => &buf[p..],
+        None => return false,
+    };
+    trimmed.starts_with(b"-> ")
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse the raw byte dump after `]: ` into a little-endian u64 (up to 8 bytes).
+fn parse_mem_value(buf: &[u8]) -> u64 {
+    let marker = b"]: ";
+    let pos = match buf.windows(marker.len()).position(|w| w == marker) {
+        Some(p) => p + marker.len(),
+        None => return 0,
+    };
+    let mut val: u64 = 0;
+    let mut byte_idx: u32 = 0;
+    let mut i = pos;
+    while i < buf.len() && byte_idx < 8 {
+        if buf[i] == b' ' {
+            if i + 1 >= buf.len() || buf[i + 1] == b' ' {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        if i + 1 >= buf.len() {
+            break;
+        }
+        match (hex_val(buf[i]), hex_val(buf[i + 1])) {
+            (Some(h), Some(l)) => {
+                val |= ((h << 4 | l) as u64) << (byte_idx * 8);
+                byte_idx += 1;
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    val
+}
+
+/// Standalone `MEM R/W 0x<addr> [N bytes]: ...` line. Returns (rw, addr, value).
+fn parse_mem_line(buf: &[u8]) -> Option<(u8, u64, u64)> {
     if buf.len() < 6 {
         return None;
     }
@@ -75,7 +133,9 @@ fn parse_mem_line(buf: &[u8]) -> Option<(u8, u64)> {
     if k == hex_start {
         return None;
     }
-    Some((rw, parse_hex_safe(&buf[hex_start..k])))
+    let addr = parse_hex_safe(&buf[hex_start..k]);
+    let val = parse_mem_value(buf);
+    Some((rw, addr, val))
 }
 
 /// Extract a leading alphanumeric token (matches C++ extract_token).
@@ -167,6 +227,30 @@ impl TraceParser {
                 continue;
             }
 
+            // !! `-> libc.so!malloc(...)` 检查必须在 `is_instruction_line`
+            // 之前,因为 `->` 行包含 `.so!`(例如 `libc.so!malloc`),
+            // 会被 `is_instruction_line` 误判为指令行;`parse_line` 随
+            // 后失败 → 行被丢弃 → ExternalCall 永远不生成。
+            if is_external_call_line(line) {
+                if let Some(prev) = pending_idx {
+                    apply_pair_inference(&mut self.lines[prev]);
+                }
+                let tl = TraceLine {
+                    line_number,
+                    file_offset: line_start,
+                    line_len: line.len() as u32,
+                    category: InsnCategory::ExternalCall,
+                    dst_regs: [crate::reg::REG_X0, 0, 0, 0],
+                    num_dst: 1,
+                    ..Default::default()
+                };
+                self.lines.push(tl);
+                pending_idx = None;
+                pending_reads = 0;
+                pending_writes = 0;
+                continue;
+            }
+
             if is_instruction_line(line) {
                 // flush inference for the previous pending instruction
                 if let Some(prev) = pending_idx {
@@ -185,18 +269,18 @@ impl TraceParser {
             }
 
             if let Some(idx) = pending_idx {
-                if let Some((rw, addr)) = parse_mem_line(line) {
+                if let Some((rw, addr, val)) = parse_mem_line(line) {
                     attach_mem(
                         &mut self.lines[idx],
                         rw,
                         addr,
+                        val,
                         &mut pending_reads,
                         &mut pending_writes,
                     );
                     continue;
                 }
             }
-            // ignore other lines (`-> libc.so!...`, headers, etc.)
         }
         // flush inference for the final pending instruction
         if let Some(prev) = pending_idx {
@@ -598,23 +682,27 @@ fn apply_pair_inference(tl: &mut TraceLine) {
     }
 }
 
-fn attach_mem(tl: &mut TraceLine, rw: u8, addr: u64, reads: &mut u8, writes: &mut u8) {
+fn attach_mem(tl: &mut TraceLine, rw: u8, addr: u64, val: u64, reads: &mut u8, writes: &mut u8) {
     if rw == b'R' {
         if *reads == 0 {
             tl.has_mem_read = true;
             tl.mem_read_addr = addr;
+            tl.mem_read_val = val;
         } else if *reads == 1 {
             tl.has_mem_read2 = true;
             tl.mem_read_addr2 = addr;
+            tl.mem_read_val2 = val;
         }
         *reads += 1;
     } else if rw == b'W' {
         if *writes == 0 {
             tl.has_mem_write = true;
             tl.mem_write_addr = addr;
+            tl.mem_write_val = val;
         } else if *writes == 1 {
             tl.has_mem_write2 = true;
             tl.mem_write_addr2 = addr;
+            tl.mem_write_val2 = val;
         }
         *writes += 1;
     }

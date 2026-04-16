@@ -515,25 +515,69 @@ fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit
     let mut mems: Vec<u64> = entry.mem_snapshot.iter().copied().collect();
     mems.sort_unstable();
 
-    let (module_offset, addr, asm) = split_trace_line(&raw);
-    let mut tainted_text = regs.join(", ");
-    for m in &mems {
-        if !tainted_text.is_empty() {
-            tainted_text.push_str(", ");
+    // ExternalCall(-> libc.so!malloc(48) ret: ...)的显示策略:
+    //   行号/模块/地址/汇编 → 显示**前一条指令**(br x17 / blr xN),
+    //     因为那才是用户在 trace 里能看到的"发起调用"的指令。
+    //   污点集 → 显示外部函数名(libc.so!malloc(48)),一目了然
+    //     "x0 来自这个外部调用的返回值"。
+    let is_ext = tl.category == large_text_taint::trace::InsnCategory::ExternalCall;
+
+    // 对 ExternalCall,找前一条指令(br/blr)来展示
+    let (hit_line_number, hit_file_offset, hit_raw, module_offset, addr, asm) = if is_ext
+        && entry.index > 0
+    {
+        let prev_tl = &lines[entry.index - 1];
+        let prev_raw = read_raw_line(bytes, prev_tl);
+        let prev_raw = prev_raw.trim_end_matches(['\n', '\r']).to_string();
+        let (mo, ad, as_) = split_trace_line(&prev_raw);
+        (prev_tl.line_number, prev_tl.file_offset, prev_raw, mo, ad, as_)
+    } else if is_ext {
+        // ExternalCall 在第一条位置(没有前一条),退化显示
+        let func_name = extract_external_call_name(&raw);
+        (tl.line_number, tl.file_offset, raw.clone(),
+         "外部调用".to_string(), String::new(), func_name)
+    } else {
+        let (mo, ad, as_) = split_trace_line(&raw);
+        (tl.line_number, tl.file_offset, raw.clone(), mo, ad, as_)
+    };
+
+    // 污点集:ExternalCall 显示函数名,普通指令显示 tainted regs/mems
+    let mut tainted_text = if is_ext {
+        extract_external_call_name(&raw)
+    } else {
+        regs.join(", ")
+    };
+    if !is_ext {
+        // 普通指令才把 mems 追加到 regs 后面
+        for m in &mems {
+            if !tainted_text.is_empty() {
+                tainted_text.push_str(", ");
+            }
+            tainted_text.push_str(&format!("mem:0x{:x}", m));
         }
-        tainted_text.push_str(&format!("mem:0x{:x}", m));
     }
 
     TaintHit {
-        file_offset: tl.file_offset,
-        line_number: tl.line_number,
-        raw_line: raw,
+        file_offset: hit_file_offset,
+        line_number: hit_line_number,
+        raw_line: hit_raw,
         module_offset,
         addr,
         asm,
         tainted_text,
         tainted_regs: regs,
         tainted_mems: mems,
+    }
+}
+
+/// 从 `-> libc.so!malloc(1440) ret: 0x78d7d22d20` 提取 `libc.so!malloc(1440)`。
+fn extract_external_call_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix("-> ").unwrap_or(trimmed);
+    // 取到 " ret:" 之前,或整行
+    match rest.find(" ret:") {
+        Some(pos) => rest[..pos].trim().to_string(),
+        None => rest.trim().to_string(),
     }
 }
 
