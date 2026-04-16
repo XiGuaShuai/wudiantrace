@@ -312,3 +312,67 @@ libtiny.so!100c 0x7000100c: \"\tadd\tx0, x8, x1\" X8=0xBB, X1=0x10 => X0=0xCB
     );
     let _ = no_val_count; // suppress unused warning
 }
+
+/// Value-sensitive tracking should survive stp/ldp save-restore pairs.
+/// When x27 is saved to the stack and restored, the expected value should
+/// propagate through: ldp → taint mem → stp → taint x27 with mem_write_val.
+/// After the pair, wrong-value writes to x27 should still be skipped.
+///
+///   line 0: adrp  x27, #0x1000          → x27 = 0xAA (WRONG)
+///   line 1: mov   x27, x10              → x27 = 0xBB (correct source)
+///   line 2: stp   x28, x27, [sp, #0x10] → save x27=0xBB to stack
+///   line 3: adrp  x27, #0x2000          → x27 = 0xCC (clobber in callee)
+///   line 4: ldp   x28, x27, [sp, #0x10] → restore x27=0xBB from stack
+///   line 5: add   x0, x27, x1           → uses x27=0xBB
+#[test]
+fn value_sensitive_survives_stp_ldp() {
+    let input = b"\
+libtiny.so!1000 0x70001000: \"\tadrp\tx27, #0x1000\" => X27=0xAA
+libtiny.so!1004 0x70001004: \"\tmov\tx27, x10\" X10=0xBB => X27=0xBB
+libtiny.so!1008 0x70001008: \"\tstp\tx28, x27, [sp, #0x10]\" X28=0xDD, X27=0xBB, SP=0x1000
+MEM W 0x1010 [8 bytes]: dd 00 00 00 00 00 00 00  ........
+MEM W 0x1018 [8 bytes]: bb 00 00 00 00 00 00 00  ........
+libtiny.so!100c 0x7000100c: \"\tadrp\tx27, #0x2000\" => X27=0xCC
+libtiny.so!1010 0x70001010: \"\tldp\tx28, x27, [sp, #0x10]\" SP=0x1000 => X28=0xDD, X27=0xBB
+MEM R 0x1010 [8 bytes]: dd 00 00 00 00 00 00 00  ........
+MEM R 0x1018 [8 bytes]: bb 00 00 00 00 00 00 00  ........
+libtiny.so!1014 0x70001014: \"\tadd\tx0, x27, x1\" X27=0xBB, X1=0x10 => X0=0xCB
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(input);
+    let lines = p.lines();
+    eprintln!("parsed {} lines", lines.len());
+    for (i, tl) in lines.iter().enumerate() {
+        eprintln!("  [{}] line {} cat={:?} dst={} src={}", i, tl.line_number,
+            tl.category, tl.num_dst, tl.num_src);
+    }
+
+    // Track x27=0xBB backward from the add (last instruction)
+    let x27 = parse_reg_name(b"x27");
+    let mut engine = TaintEngine::new();
+    engine.set_mode(TrackMode::Backward);
+    engine.set_source(TaintSource::from_reg_as_source_with_val(x27, 0xBB));
+    engine.set_max_scan_distance(1000);
+    engine.run_with_bytes(lines, lines.len() - 1, input);
+
+    let results = engine.results();
+    eprintln!("results: {}", results.len());
+    for r in results {
+        eprintln!("  hit index={} (line {})", r.index, lines[r.index].line_number);
+    }
+
+    // Should hit: add (start), ldp (restore), stp (save), mov (real source)
+    // Should NOT hit: adrp x27 #0x1000 (0xAA), adrp x27 #0x2000 (0xCC)
+    assert!(
+        results.iter().any(|r| r.index == 1),
+        "should hit mov x27, x10 (real source)"
+    );
+    assert!(
+        !results.iter().any(|r| r.index == 0),
+        "should NOT hit adrp x27 #0x1000 (wrong value 0xAA)"
+    );
+    assert!(
+        !results.iter().any(|r| r.index == 3),
+        "should NOT hit adrp x27 #0x2000 (wrong value 0xCC)"
+    );
+}

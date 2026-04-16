@@ -486,6 +486,8 @@ impl TaintEngine {
                 for i in 0..line.num_dst as usize {
                     if self.is_reg_tainted(line.dst_regs[i]) {
                         self.untaint_reg(line.dst_regs[i]);
+                        let nid = normalize(line.dst_regs[i]) as usize;
+                        self.reg_has_expected_val[nid] = false;
                     }
                 }
             }
@@ -494,7 +496,27 @@ impl TaintEngine {
                 let dst_t = self.any_dst_tainted(line);
                 let nzcv_t = line.sets_flags && self.is_reg_tainted(REG_NZCV);
                 if dst_t || nzcv_t {
+                    // Capture expected value from the first tainted dst
+                    // before untainting. For DataMove the value transfers
+                    // directly to src; for others we can't reverse the
+                    // operation so we drop it.
+                    let propagate_val = if line.category == DataMove {
+                        let mut val: Option<u64> = None;
+                        for i in 0..line.num_dst as usize {
+                            let nid = normalize(line.dst_regs[i]) as usize;
+                            if self.reg_taint[nid] && self.reg_has_expected_val[nid] {
+                                val = Some(self.reg_expected_val[nid]);
+                                break;
+                            }
+                        }
+                        val
+                    } else {
+                        None
+                    };
+
                     for i in 0..line.num_dst as usize {
+                        let nid = normalize(line.dst_regs[i]) as usize;
+                        self.reg_has_expected_val[nid] = false;
                         self.untaint_reg(line.dst_regs[i]);
                     }
                     if nzcv_t {
@@ -502,6 +524,12 @@ impl TaintEngine {
                     }
                     for i in 0..line.num_src as usize {
                         self.taint_reg(line.src_regs[i]);
+                        // DataMove: value unchanged, propagate expected_val
+                        if let Some(val) = propagate_val {
+                            let nid = normalize(line.src_regs[i]) as usize;
+                            self.reg_expected_val[nid] = val;
+                            self.reg_has_expected_val[nid] = true;
+                        }
                     }
                 }
             }
@@ -547,6 +575,11 @@ impl TaintEngine {
                                 }
                             }
                             self.taint_reg(line.src_regs[0]);
+                            // Propagate expected value: the register held
+                            // mem_write_val when this store executed.
+                            let nid = normalize(line.src_regs[0]) as usize;
+                            self.reg_expected_val[nid] = line.mem_write_val;
+                            self.reg_has_expected_val[nid] = true;
                         }
                         if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr2) {
                             if let Some(expected) = entry {
@@ -560,6 +593,9 @@ impl TaintEngine {
                                 }
                             }
                             self.taint_reg(line.src_regs[1]);
+                            let nid = normalize(line.src_regs[1]) as usize;
+                            self.reg_expected_val[nid] = line.mem_write_val2;
+                            self.reg_has_expected_val[nid] = true;
                         }
                     } else if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr) {
                         if let Some(expected) = entry {
@@ -574,6 +610,9 @@ impl TaintEngine {
                         }
                         if line.num_src > 0 {
                             self.taint_reg(line.src_regs[0]);
+                            let nid = normalize(line.src_regs[0]) as usize;
+                            self.reg_expected_val[nid] = line.mem_write_val;
+                            self.reg_has_expected_val[nid] = true;
                         }
                     }
                 }
@@ -729,13 +768,6 @@ impl TaintEngine {
                         involved = self.check_dst_values(line, bytes);
                     }
                     if involved {
-                        // Clear expected values for all dst registers about to
-                        // be processed — after the first hop, further tracking
-                        // is name-based only.
-                        for d in 0..line.num_dst as usize {
-                            let nid = normalize(line.dst_regs[d]) as usize;
-                            self.reg_has_expected_val[nid] = false;
-                        }
                         self.propagate_backward(line, i as usize);
                         self.record(i as usize);
                         idle = 0;
