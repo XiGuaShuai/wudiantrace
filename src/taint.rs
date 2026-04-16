@@ -72,6 +72,7 @@ pub struct TaintState {
     pub source_text: String, // e.g. "x0", "w12", "sp", "mem:0x12345"
     pub start_line_text: String,
     pub scan_limit_text: String,
+    pub max_depth_text: String,
     pub forward_window_mb_text: String,
 
     // Background job
@@ -109,6 +110,7 @@ impl Default for TaintState {
             source_text: String::new(),
             start_line_text: String::new(),
             scan_limit_text: "50000".to_string(),
+            max_depth_text: "64".to_string(),
             forward_window_mb_text: "200".to_string(),
             running: false,
             status_text: String::new(),
@@ -204,6 +206,11 @@ impl TaintState {
             .trim()
             .parse()
             .map_err(|_| "扫描上限必须是非负整数".to_string())?;
+        let max_depth: u32 = self
+            .max_depth_text
+            .trim()
+            .parse()
+            .map_err(|_| "追踪深度必须是正整数".to_string())?;
         let window_mb: u64 = self
             .forward_window_mb_text
             .trim()
@@ -246,6 +253,7 @@ impl TaintState {
             start_offset,
             start_line,
             scan_limit,
+            max_depth,
             forward_window_bytes: window_mb.saturating_mul(1024 * 1024),
             cancel: cancel.clone(),
             tx,
@@ -315,6 +323,7 @@ struct JobConfig {
     start_offset: Option<u64>,
     start_line: u32,
     scan_limit: u32,
+    max_depth: u32,
     forward_window_bytes: u64,
     cancel: Arc<AtomicBool>,
     tx: Sender<TaintMessage>,
@@ -329,6 +338,7 @@ fn run_job(job: JobConfig) {
         start_offset,
         start_line,
         scan_limit,
+        max_depth,
         forward_window_bytes,
         cancel,
         tx,
@@ -428,6 +438,7 @@ fn run_job(job: JobConfig) {
     engine.set_mode(mode);
     engine.set_source(source);
     engine.set_max_scan_distance(scan_limit);
+    engine.set_max_depth(max_depth);
     engine.set_cancel_token(cancel.clone());
     engine.run_with_bytes(parser.lines(), start_index, bytes);
 
@@ -845,15 +856,25 @@ pub fn render_dialog(
             ui.add_space(8.0);
             ui.collapsing("高级选项", |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("扫描上限:");
+                    ui.label("结果上限:");
                     ui.add(
                         egui::TextEdit::singleline(&mut state.scan_limit_text)
                             .desired_width(80.0),
                     )
                     .on_hover_text(
-                        "连续 N 条指令无污点传播则停止",
+                        "最大结果条数(向前:连续空闲行数;向后:BFS 节点数)",
                     );
                 });
+                if state.mode == TrackMode::Backward {
+                    ui.horizontal(|ui| {
+                        ui.label("追踪深度:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.max_depth_text)
+                                .desired_width(60.0),
+                        )
+                        .on_hover_text("反向追踪的最大依赖跳数(默认 64)");
+                    });
+                }
                 if state.mode == TrackMode::Forward {
                     ui.horizontal(|ui| {
                         ui.label("向前加载窗口 (MB):");
