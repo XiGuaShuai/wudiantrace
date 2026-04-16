@@ -332,6 +332,13 @@ impl TextViewerApp {
         self.search_page_start_index = 0;
         self.page_offsets.clear();
         self.search_engine.clear();
+        // 搜索结果面板的缓存以 byte_offset 为 key,换一次搜索后
+        // 命中位置完全不同,旧缓存全部失效。之前漏清了这三个,
+        // 导致"多次搜索后行号全变 1、预览空白"(新 byte_offset
+        // 在旧 cache 里查不到 → unwrap_or(0) / unwrap_or_default)。
+        self.search_preview_cache.clear();
+        self.search_line_cache.clear();
+        self.search_preview_cache_key = None;
 
         if self.search_in_progress {
             self.status_message = "Search already running...".to_string();

@@ -70,6 +70,20 @@ pub struct TaintEngine {
     /// 出现过"主视图行号和 parser 精确行号不一致"的混乱(稀疏索引
     /// 估算偏差),把精确起点行号/字节写进日志可一眼对账。
     start_index: Option<usize>,
+    /// 反向追踪到 trace 起点 / 窗口边界时,如果 taint 集仍非空,
+    /// 说明这些寄存器/内存的来源在当前 trace 覆盖范围之前(例如
+    /// 函数入参、全局状态)。这个字段记录"剩余 tainted"的快照,
+    /// 供 format_result 和 UI 显示"来源在 trace 之前"的提示。
+    remaining_taint_at_boundary: Option<RemainingTaint>,
+}
+
+/// 反向追踪到达 trace 边界时仍未清零的 taint 信息。
+/// `regs` / `mems` 由 engine 在 run() 结束时捕获;调用方(UI 层)
+/// 负责从 trace 首行提取函数名和 LR 填到展示里。
+#[derive(Clone, Debug)]
+pub struct RemainingTaint {
+    pub regs: Vec<String>,
+    pub mems: Vec<u64>,
 }
 
 impl Default for TaintEngine {
@@ -91,7 +105,12 @@ impl TaintEngine {
             results: Vec::new(),
             stop_reason: StopReason::EndOfTrace,
             start_index: None,
+            remaining_taint_at_boundary: None,
         }
+    }
+
+    pub fn remaining_taint(&self) -> Option<&RemainingTaint> {
+        self.remaining_taint_at_boundary.as_ref()
     }
 
     pub fn set_mode(&mut self, mode: TrackMode) {
@@ -414,6 +433,7 @@ impl TaintEngine {
         self.results.clear();
         self.stop_reason = StopReason::EndOfTrace;
         self.start_index = None;
+        self.remaining_taint_at_boundary = None;
         if lines.is_empty() || start_index >= lines.len() {
             return;
         }
@@ -509,6 +529,21 @@ impl TaintEngine {
                     i -= 1;
                 }
                 self.results.reverse();
+                // 反向追踪结束后,如果 taint 集仍非空(没有
+                // AllTaintCleared),说明这些值的来源在 trace 覆盖
+                // 范围之前 —— 典型场景:函数入参、全局变量、
+                // hook 前的寄存器状态。记录下来供 UI 展示。
+                if self.tainted_reg_count > 0 || !self.tainted_mem.is_empty() {
+                    let mut regs = Vec::new();
+                    for i in 0..256u16 {
+                        if self.reg_taint[i as usize] {
+                            regs.push(reg_name(i as u8).to_string());
+                        }
+                    }
+                    let mut mems: Vec<u64> = self.tainted_mem.iter().copied().collect();
+                    mems.sort_unstable();
+                    self.remaining_taint_at_boundary = Some(RemainingTaint { regs, mems });
+                }
             }
         }
     }
@@ -563,6 +598,38 @@ impl TaintEngine {
             StopReason::Cancelled => "cancelled".to_string(),
         };
         out.push_str(&format!("Stop reason: {}\n", stop));
+
+        // 如果反向追踪到边界仍有未清 taint,提示来源在 trace 之前
+        if let Some(ref remaining) = self.remaining_taint_at_boundary {
+            out.push_str("⚠ 以下 taint 在到达 trace 边界时仍未清除:\n");
+            out.push_str(&format!("  寄存器: {}\n",
+                if remaining.regs.is_empty() { "(无)".to_string() }
+                else { remaining.regs.join(", ") }
+            ));
+            if !remaining.mems.is_empty() {
+                let mems: Vec<String> = remaining.mems.iter().map(|a| format!("0x{:x}", a)).collect();
+                out.push_str(&format!("  内存: {}\n", mems.join(", ")));
+            }
+            // 从 trace 窗口的第一条指令提取函数名和 LR
+            if !lines.is_empty() {
+                let first_line = read_raw_line(bytes, &lines[0]);
+                let first_line = first_line.trim();
+                // 函数名 = 第一个空格前的 "module!offset"
+                let func_id = first_line.split_whitespace().next().unwrap_or("?");
+                // LR = 在行里找 "LR=" 后面的值
+                let lr = first_line.find("LR=")
+                    .map(|pos| {
+                        let rest = &first_line[pos + 3..];
+                        rest.split([',', ' ', ')']).next().unwrap_or("?")
+                    })
+                    .unwrap_or("?");
+                out.push_str(&format!(
+                    "  → 这些值是函数 {} 的入参/初始状态,由调用方(LR={})传入\n",
+                    func_id, lr
+                ));
+            }
+        }
+
         out.push_str("============================================================\n\n");
 
         for entry in &self.results {
