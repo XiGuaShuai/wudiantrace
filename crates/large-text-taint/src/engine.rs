@@ -1,12 +1,23 @@
-//! Taint propagation engine — direct port of TaintEngine.{h,cpp}.
+//! Taint propagation engine.
+//!
+//! Forward mode: linear taint-bitmap propagation (unchanged from original).
+//! Backward mode: forward-scan builds def-use dependency graph, then BFS
+//! traverses it from the target instruction to find all data sources.
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::parser::read_raw_line;
 use crate::reg::{normalize, reg_name, RegId, REG_INVALID, REG_NZCV, REG_XZR};
 use crate::trace::{InsnCategory, TraceLine};
+
+/// Sentinel: "this register/memory has no definition in the scanned range."
+const NO_DEF: u32 = u32::MAX;
+
+// ───────────────────────── public types ─────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TrackMode {
@@ -27,67 +38,31 @@ pub struct TaintSource {
     pub reg: RegId,
     pub mem_addr: u64,
     pub is_mem: bool,
-    /// When true, the engine skips `propagate_backward` on the starting line
-    /// and just records it. Use this when the user wants to track a *source*
-    /// register of the starting instruction (e.g. the address-offset register
-    /// of a Load) rather than a *destination* register.
+    /// When true (backward mode), BFS seeds from `reg_last_def[reg]`
+    /// instead of from the full deps of the start instruction. Used for
+    /// tracking address-source registers of Load instructions.
     pub skip_start_propagation: bool,
-    /// Optional expected register value for value-sensitive backward tracking.
-    /// When set, the engine will skip instructions whose output value for the
-    /// tracked register doesn't match, avoiding false hits from unrelated
-    /// overwrites of the same register.
+    /// Optional expected register value. Preserved for API compatibility
+    /// but no longer used by the dep-graph backward engine (def-use chains
+    /// are structurally precise).
     pub expected_val: Option<u64>,
 }
 
 impl TaintSource {
     pub fn from_reg(reg: RegId) -> Self {
-        Self {
-            reg,
-            mem_addr: 0,
-            is_mem: false,
-            skip_start_propagation: false,
-            expected_val: None,
-        }
+        Self { reg, mem_addr: 0, is_mem: false, skip_start_propagation: false, expected_val: None }
     }
     pub fn from_reg_with_val(reg: RegId, val: u64) -> Self {
-        Self {
-            reg,
-            mem_addr: 0,
-            is_mem: false,
-            skip_start_propagation: false,
-            expected_val: Some(val),
-        }
+        Self { reg, mem_addr: 0, is_mem: false, skip_start_propagation: false, expected_val: Some(val) }
     }
     pub fn from_mem(addr: u64) -> Self {
-        Self {
-            reg: REG_INVALID,
-            mem_addr: addr,
-            is_mem: true,
-            skip_start_propagation: false,
-            expected_val: None,
-        }
+        Self { reg: REG_INVALID, mem_addr: addr, is_mem: true, skip_start_propagation: false, expected_val: None }
     }
-    /// Create a source that tracks a register but skips backward propagation
-    /// on the starting line. Used for tracking address-source registers of
-    /// Load instructions (e.g. the x8 in `ldr x8, [x27, x8]` as the address
-    /// offset, not as the loaded value).
     pub fn from_reg_as_source(reg: RegId) -> Self {
-        Self {
-            reg,
-            mem_addr: 0,
-            is_mem: false,
-            skip_start_propagation: true,
-            expected_val: None,
-        }
+        Self { reg, mem_addr: 0, is_mem: false, skip_start_propagation: true, expected_val: None }
     }
     pub fn from_reg_as_source_with_val(reg: RegId, val: u64) -> Self {
-        Self {
-            reg,
-            mem_addr: 0,
-            is_mem: false,
-            skip_start_propagation: true,
-            expected_val: Some(val),
-        }
+        Self { reg, mem_addr: 0, is_mem: false, skip_start_propagation: true, expected_val: Some(val) }
     }
 }
 
@@ -108,42 +83,250 @@ pub struct ValueMismatch {
     pub actual_val: u64,
 }
 
+/// 反向追踪到达 trace 边界时仍未清零的 taint 信息。
+#[derive(Clone, Debug)]
+pub struct RemainingTaint {
+    pub regs: Vec<String>,
+    pub mems: Vec<u64>,
+}
+
+// ───────────────────── dep-graph (backward) ─────────────────────
+
+/// Forward-scan state used to build the per-instruction dependency graph.
+struct DepGraphBuilder {
+    /// For each register, the index of the instruction that last defined it.
+    reg_last_def: [u32; 256],
+    /// For each memory address, the index of the instruction that last wrote it.
+    mem_last_def: FxHashMap<u64, u32>,
+}
+
+impl DepGraphBuilder {
+    fn new() -> Self {
+        Self {
+            reg_last_def: [NO_DEF; 256],
+            mem_last_def: FxHashMap::default(),
+        }
+    }
+
+    /// Look up the most recent definition of `reg`. Returns `None` if the
+    /// register has never been defined in the scanned range.
+    #[inline]
+    fn reg_def(&self, reg: RegId) -> Option<u32> {
+        if reg == REG_INVALID || reg == REG_XZR {
+            return None;
+        }
+        let idx = self.reg_last_def[normalize(reg) as usize];
+        if idx == NO_DEF { None } else { Some(idx) }
+    }
+
+    /// Record that instruction `i` defines `reg`.
+    #[inline]
+    fn set_reg_def(&mut self, reg: RegId, i: u32) {
+        if reg == REG_INVALID || reg == REG_XZR {
+            return;
+        }
+        self.reg_last_def[normalize(reg) as usize] = i;
+    }
+
+    /// Build the dependency graph for `lines[0..=end]`.
+    ///
+    /// Returns `(deps, reg_last_def_snapshot)` where the snapshot is the
+    /// register definition state *just before* instruction `end` updates
+    /// its own definitions (needed for `skip_start_propagation` lookups).
+    fn build(
+        &mut self,
+        lines: &[TraceLine],
+        end: usize,
+        cancel: &Option<Arc<AtomicBool>>,
+    ) -> (Vec<SmallVec<[u32; 4]>>, [u32; 256]) {
+        let n = end + 1;
+        let mut deps: Vec<SmallVec<[u32; 4]>> = Vec::with_capacity(n);
+        let mut snapshot = [NO_DEF; 256];
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            // Check cancellation every 100k lines
+            if i & 0x1_FFFF == 0 {
+                if let Some(c) = cancel {
+                    if c.load(Ordering::Relaxed) {
+                        // Fill remaining with empty deps so indices stay valid
+                        deps.resize_with(n, SmallVec::new);
+                        return (deps, snapshot);
+                    }
+                }
+            }
+
+            let line = &lines[i];
+            let mut preds = SmallVec::<[u32; 4]>::new();
+
+            // ── collect source dependencies ──
+
+            // For ImmLoad, dst is defined from an immediate — no source deps.
+            // For ExternalCall, caller-saved regs are clobbered — no source deps
+            // for those regs (the call itself is a "definition from outside").
+            let skip_src_deps = matches!(
+                line.category,
+                InsnCategory::ImmLoad | InsnCategory::ExternalCall
+            );
+
+            if !skip_src_deps {
+                // Register sources
+                for j in 0..line.num_src as usize {
+                    if let Some(def) = self.reg_def(line.src_regs[j]) {
+                        push_unique(&mut preds, def);
+                    }
+                }
+
+                // CondSelect / conditional Branch: implicit NZCV dependency
+                if matches!(line.category, InsnCategory::CondSelect) {
+                    if let Some(def) = self.reg_def(REG_NZCV) {
+                        push_unique(&mut preds, def);
+                    }
+                }
+
+                // PartialModify (movk): also depends on previous definition
+                // of the dst register (read-modify-write).
+                if line.category == InsnCategory::PartialModify {
+                    for j in 0..line.num_dst as usize {
+                        if let Some(def) = self.reg_def(line.dst_regs[j]) {
+                            push_unique(&mut preds, def);
+                        }
+                    }
+                }
+            }
+
+            // Memory read dependencies (for Load and any instruction that
+            // reads memory)
+            if line.has_mem_read {
+                if let Some(&def) = self.mem_last_def.get(&line.mem_read_addr) {
+                    push_unique(&mut preds, def);
+                }
+            }
+            if line.has_mem_read2 {
+                if let Some(&def) = self.mem_last_def.get(&line.mem_read_addr2) {
+                    push_unique(&mut preds, def);
+                }
+            }
+
+            deps.push(preds);
+
+            // ── snapshot reg_last_def right before start updates ──
+            if i == end {
+                snapshot = self.reg_last_def;
+            }
+
+            // ── update definitions ──
+
+            match line.category {
+                InsnCategory::ExternalCall => {
+                    // Clobber caller-saved: x0-x18 + NZCV
+                    for r in 0..=18u8 {
+                        self.set_reg_def(r, i as u32);
+                    }
+                    self.reg_last_def[REG_NZCV as usize] = i as u32;
+                }
+                InsnCategory::Branch => {
+                    // Branches don't define registers (except BL which is
+                    // ExternalCall). Nothing to update.
+                }
+                _ => {
+                    for j in 0..line.num_dst as usize {
+                        self.set_reg_def(line.dst_regs[j], i as u32);
+                    }
+                    if line.sets_flags {
+                        self.reg_last_def[REG_NZCV as usize] = i as u32;
+                    }
+                }
+            }
+
+            // Memory write definitions
+            if line.has_mem_write {
+                self.mem_last_def.insert(line.mem_write_addr, i as u32);
+            }
+            if line.has_mem_write2 {
+                self.mem_last_def.insert(line.mem_write_addr2, i as u32);
+            }
+        }
+
+        (deps, snapshot)
+    }
+}
+
+/// BFS backward on the dependency graph from `seeds`. Returns visited
+/// instruction indices in ascending order.
+fn bfs_backward(
+    deps: &[SmallVec<[u32; 4]>],
+    seeds: &[u32],
+    max_nodes: usize,
+    cancel: &Option<Arc<AtomicBool>>,
+) -> Vec<usize> {
+    let n = deps.len();
+    let mut visited = vec![false; n];
+    let mut queue = VecDeque::new();
+
+    for &seed in seeds {
+        let s = seed as usize;
+        if s < n && !visited[s] {
+            visited[s] = true;
+            queue.push_back(seed);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        for &pred in &deps[idx as usize] {
+            let p = pred as usize;
+            if p < n && !visited[p] {
+                visited[p] = true;
+                queue.push_back(pred);
+                // Count check: seeds already counted
+                let count = queue.len();
+                if count >= max_nodes {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Collect in ascending order
+    let mut result = Vec::new();
+    for (i, &v) in visited.iter().enumerate() {
+        if v {
+            result.push(i);
+        }
+    }
+    result
+}
+
+#[inline]
+fn push_unique(v: &mut SmallVec<[u32; 4]>, val: u32) {
+    if !v.contains(&val) {
+        v.push(val);
+    }
+}
+
+// ───────────────────────── engine ─────────────────────────
+
 pub struct TaintEngine {
     mode: TrackMode,
     source: TaintSource,
     max_scan_distance: u32,
     cancel: Option<Arc<AtomicBool>>,
 
+    // Forward-mode state (taint bitmap propagation)
     reg_taint: [bool; 256],
     tainted_reg_count: i32,
-    /// Value-sensitive backward tracking: expected output value per register.
-    /// Only registers with `reg_has_expected_val[id] == true` are checked.
-    reg_expected_val: [u64; 256],
-    reg_has_expected_val: [bool; 256],
     tainted_mem: FxHashMap<u64, Option<u64>>,
+
     results: Vec<ResultEntry>,
     mismatches: Vec<ValueMismatch>,
     stop_reason: StopReason,
-    /// 上次 `run()` 的起点在 parser.lines() 里的下标。`None` 表示从未
-    /// 调用过 run()。`format_result` 里会根据这个字段在日志 header
-    /// 打印 "Started from: line N (file offset 0xXXX)" —— 历史上
-    /// 出现过"主视图行号和 parser 精确行号不一致"的混乱(稀疏索引
-    /// 估算偏差),把精确起点行号/字节写进日志可一眼对账。
     start_index: Option<usize>,
-    /// 反向追踪到 trace 起点 / 窗口边界时,如果 taint 集仍非空,
-    /// 说明这些寄存器/内存的来源在当前 trace 覆盖范围之前(例如
-    /// 函数入参、全局状态)。这个字段记录"剩余 tainted"的快照,
-    /// 供 format_result 和 UI 显示"来源在 trace 之前"的提示。
     remaining_taint_at_boundary: Option<RemainingTaint>,
-}
-
-/// 反向追踪到达 trace 边界时仍未清零的 taint 信息。
-/// `regs` / `mems` 由 engine 在 run() 结束时捕获;调用方(UI 层)
-/// 负责从 trace 首行提取函数名和 LR 填到展示里。
-#[derive(Clone, Debug)]
-pub struct RemainingTaint {
-    pub regs: Vec<String>,
-    pub mems: Vec<u64>,
 }
 
 impl Default for TaintEngine {
@@ -161,8 +344,6 @@ impl TaintEngine {
             cancel: None,
             reg_taint: [false; 256],
             tainted_reg_count: 0,
-            reg_expected_val: [0; 256],
-            reg_has_expected_val: [false; 256],
             tainted_mem: FxHashMap::default(),
             results: Vec::new(),
             mismatches: Vec::new(),
@@ -176,41 +357,20 @@ impl TaintEngine {
         self.remaining_taint_at_boundary.as_ref()
     }
 
-    pub fn set_mode(&mut self, mode: TrackMode) {
-        self.mode = mode;
-    }
-    pub fn set_max_scan_distance(&mut self, n: u32) {
-        self.max_scan_distance = n;
-    }
-    pub fn set_cancel_token(&mut self, token: Arc<AtomicBool>) {
-        self.cancel = Some(token);
-    }
-    pub fn stop_reason(&self) -> StopReason {
-        self.stop_reason
-    }
-    pub fn results(&self) -> &[ResultEntry] {
-        &self.results
-    }
-    pub fn into_results(self) -> Vec<ResultEntry> {
-        self.results
-    }
-    pub fn mode(&self) -> TrackMode {
-        self.mode
-    }
-    pub fn source(&self) -> TaintSource {
-        self.source
-    }
-
-    pub fn mismatches(&self) -> &[ValueMismatch] {
-        &self.mismatches
-    }
+    pub fn set_mode(&mut self, mode: TrackMode) { self.mode = mode; }
+    pub fn set_max_scan_distance(&mut self, n: u32) { self.max_scan_distance = n; }
+    pub fn set_cancel_token(&mut self, token: Arc<AtomicBool>) { self.cancel = Some(token); }
+    pub fn stop_reason(&self) -> StopReason { self.stop_reason }
+    pub fn results(&self) -> &[ResultEntry] { &self.results }
+    pub fn into_results(self) -> Vec<ResultEntry> { self.results }
+    pub fn mode(&self) -> TrackMode { self.mode }
+    pub fn source(&self) -> TaintSource { self.source }
+    pub fn mismatches(&self) -> &[ValueMismatch] { &self.mismatches }
 
     pub fn set_source(&mut self, source: TaintSource) {
         self.source = source;
         self.reg_taint = [false; 256];
         self.tainted_reg_count = 0;
-        self.reg_expected_val = [0; 256];
-        self.reg_has_expected_val = [false; 256];
         self.tainted_mem.clear();
         self.results.clear();
         self.mismatches.clear();
@@ -220,19 +380,14 @@ impl TaintEngine {
             self.tainted_mem.insert(source.mem_addr, None);
         } else {
             self.taint_reg(source.reg);
-            if let Some(val) = source.expected_val {
-                let nid = normalize(source.reg) as usize;
-                self.reg_expected_val[nid] = val;
-                self.reg_has_expected_val[nid] = true;
-            }
         }
     }
 
+    // ───────── forward-mode helpers (unchanged) ─────────
+
     #[inline]
     fn taint_reg(&mut self, id: RegId) {
-        if id == REG_INVALID || id == REG_XZR {
-            return;
-        }
+        if id == REG_INVALID || id == REG_XZR { return; }
         let nid = normalize(id) as usize;
         if !self.reg_taint[nid] {
             self.reg_taint[nid] = true;
@@ -240,66 +395,9 @@ impl TaintEngine {
         }
     }
 
-    /// Check whether an instruction's output values for tainted dst registers
-    /// match the expected values. Returns `true` if the instruction should
-    /// still be considered "involved", `false` if values mismatch (= skip).
-    ///
-    /// If no expected value is set for any tainted dst register, returns `true`
-    /// (no filtering). Only checks registers that have both taint AND an
-    /// expected value.
-    /// Taint all source registers of an instruction and set their expected
-    /// values by parsing the INPUT section of the raw trace line. Used by
-    /// Load backward to also track address-forming registers.
-    fn taint_src_regs_with_values(&mut self, line: &TraceLine, bytes: &[u8]) {
-        for i in 0..line.num_src as usize {
-            let id = line.src_regs[i];
-            self.taint_reg(id);
-            // Parse input value from raw bytes for value-sensitive tracking
-            if !bytes.is_empty() {
-                let off = line.file_offset as usize;
-                let len = line.line_len as usize;
-                if off.saturating_add(len) <= bytes.len() {
-                    let raw = &bytes[off..off + len];
-                    if let Some(val) = crate::parser::parse_input_reg_val(raw, id) {
-                        let nid = normalize(id) as usize;
-                        self.reg_expected_val[nid] = val;
-                        self.reg_has_expected_val[nid] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    fn check_dst_values(&self, line: &TraceLine, bytes: &[u8]) -> bool {
-        for d in 0..line.num_dst as usize {
-            let nid = normalize(line.dst_regs[d]) as usize;
-            if !self.reg_taint[nid] || !self.reg_has_expected_val[nid] {
-                continue;
-            }
-            // Parse the output value from the raw trace line
-            let off = line.file_offset as usize;
-            let len = line.line_len as usize;
-            if off.saturating_add(len) > bytes.len() {
-                continue; // can't read raw line, skip check
-            }
-            let raw = &bytes[off..off + len];
-            if let Some(actual_val) =
-                crate::parser::parse_output_reg_val(raw, line.dst_regs[d])
-            {
-                if actual_val != self.reg_expected_val[nid] {
-                    return false; // value mismatch → skip this instruction
-                }
-            }
-            // If we can't parse the value, be conservative and allow it
-        }
-        true // no mismatch found (or nothing to check)
-    }
-
     #[inline]
     fn untaint_reg(&mut self, id: RegId) {
-        if id == REG_INVALID || id == REG_XZR {
-            return;
-        }
+        if id == REG_INVALID || id == REG_XZR { return; }
         let nid = normalize(id) as usize;
         if self.reg_taint[nid] {
             self.reg_taint[nid] = false;
@@ -309,77 +407,44 @@ impl TaintEngine {
 
     #[inline]
     fn is_reg_tainted(&self, id: RegId) -> bool {
-        if id == REG_INVALID || id == REG_XZR {
-            return false;
-        }
+        if id == REG_INVALID || id == REG_XZR { return false; }
         self.reg_taint[normalize(id) as usize]
     }
 
     fn any_src_tainted(&self, line: &TraceLine) -> bool {
         for i in 0..line.num_src as usize {
-            if self.is_reg_tainted(line.src_regs[i]) {
-                return true;
-            }
+            if self.is_reg_tainted(line.src_regs[i]) { return true; }
         }
-        if line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr) {
-            return true;
-        }
-        if line.has_mem_read2 && self.tainted_mem.contains_key(&line.mem_read_addr2) {
-            return true;
-        }
+        if line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr) { return true; }
+        if line.has_mem_read2 && self.tainted_mem.contains_key(&line.mem_read_addr2) { return true; }
         false
     }
 
-    fn any_dst_tainted(&self, line: &TraceLine) -> bool {
-        for i in 0..line.num_dst as usize {
-            if self.is_reg_tainted(line.dst_regs[i]) {
-                return true;
-            }
+    fn any_caller_saved_tainted(&self) -> bool {
+        for reg_id in 0..=18u8 {
+            if self.is_reg_tainted(reg_id) { return true; }
         }
-        if line.has_mem_write && self.tainted_mem.contains_key(&line.mem_write_addr) {
-            return true;
-        }
-        if line.has_mem_write2 && self.tainted_mem.contains_key(&line.mem_write_addr2) {
-            return true;
-        }
-        false
+        self.is_reg_tainted(REG_NZCV)
+    }
+
+    fn untaint_caller_saved(&mut self) {
+        for reg_id in 0..=18u8 { self.untaint_reg(reg_id); }
+        self.untaint_reg(REG_NZCV);
     }
 
     fn record(&mut self, index: usize) {
         self.results.push(ResultEntry {
             index,
             reg_snapshot: self.reg_taint,
-            mem_snapshot: self.tainted_mem.keys().copied().collect::<Vec<_>>(),
+            mem_snapshot: self.tainted_mem.keys().copied().collect(),
         });
-    }
-
-    /// ARM64 caller-saved 寄存器:x0-x18 + NZCV。外部函数调用后
-    /// 这些全部可能被覆盖。
-    fn untaint_caller_saved(&mut self) {
-        for reg_id in 0..=18u8 {
-            self.untaint_reg(reg_id); // x0-x18
-        }
-        self.untaint_reg(REG_NZCV);
-    }
-
-    /// caller-saved 里有没有 tainted 的(用于 ExternalCall 参与判断)。
-    fn any_caller_saved_tainted(&self) -> bool {
-        for reg_id in 0..=18u8 {
-            if self.is_reg_tainted(reg_id) {
-                return true;
-            }
-        }
-        self.is_reg_tainted(REG_NZCV)
     }
 
     fn check_mem_read_mismatch(&mut self, addr: u64, actual_val: u64, index: usize) {
         if let Some(&Some(expected)) = self.tainted_mem.get(&addr) {
             if expected != actual_val {
                 self.mismatches.push(ValueMismatch {
-                    index,
-                    mem_addr: addr,
-                    expected_val: expected,
-                    actual_val,
+                    index, mem_addr: addr, expected_val: expected, actual_val,
                 });
             }
         }
@@ -389,60 +454,39 @@ impl TaintEngine {
         use InsnCategory::*;
         match line.category {
             ImmLoad => {
-                for i in 0..line.num_dst as usize {
-                    self.untaint_reg(line.dst_regs[i]);
-                }
+                for i in 0..line.num_dst as usize { self.untaint_reg(line.dst_regs[i]); }
             }
-            ExternalCall => {
-                self.untaint_caller_saved();
-            }
+            ExternalCall => { self.untaint_caller_saved(); }
             PartialModify => {}
             DataMove | Arithmetic | Logic | ShiftExt | Bitfield | CondSelect => {
                 let src_t = self.any_src_tainted(line);
                 for i in 0..line.num_dst as usize {
-                    if src_t {
-                        self.taint_reg(line.dst_regs[i]);
-                    } else {
-                        self.untaint_reg(line.dst_regs[i]);
-                    }
+                    if src_t { self.taint_reg(line.dst_regs[i]); }
+                    else { self.untaint_reg(line.dst_regs[i]); }
                 }
                 if line.sets_flags {
-                    if src_t {
-                        self.taint_reg(REG_NZCV);
-                    } else {
-                        self.untaint_reg(REG_NZCV);
-                    }
+                    if src_t { self.taint_reg(REG_NZCV); }
+                    else { self.untaint_reg(REG_NZCV); }
                 }
             }
             Load => {
                 if line.has_mem_read2 && line.num_dst >= 2 {
-                    let mem_t1 =
-                        line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
+                    let mem_t1 = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
                     let mem_t2 = self.tainted_mem.contains_key(&line.mem_read_addr2);
                     if mem_t1 {
                         self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
                         self.taint_reg(line.dst_regs[0]);
-                    } else {
-                        self.untaint_reg(line.dst_regs[0]);
-                    }
+                    } else { self.untaint_reg(line.dst_regs[0]); }
                     if mem_t2 {
                         self.check_mem_read_mismatch(line.mem_read_addr2, line.mem_read_val2, index);
                         self.taint_reg(line.dst_regs[1]);
-                    } else {
-                        self.untaint_reg(line.dst_regs[1]);
-                    }
+                    } else { self.untaint_reg(line.dst_regs[1]); }
                 } else {
-                    let mem_t =
-                        line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
-                    if mem_t {
-                        self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
-                    }
+                    let mem_t = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
+                    if mem_t { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); }
                     for i in 0..line.num_dst as usize {
-                        if mem_t {
-                            self.taint_reg(line.dst_regs[i]);
-                        } else {
-                            self.untaint_reg(line.dst_regs[i]);
-                        }
+                        if mem_t { self.taint_reg(line.dst_regs[i]); }
+                        else { self.untaint_reg(line.dst_regs[i]); }
                     }
                 }
             }
@@ -451,252 +495,51 @@ impl TaintEngine {
                     if line.has_mem_write2 && line.num_src >= 2 {
                         if self.is_reg_tainted(line.src_regs[0]) {
                             self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
-                        } else {
-                            self.tainted_mem.remove(&line.mem_write_addr);
-                        }
+                        } else { self.tainted_mem.remove(&line.mem_write_addr); }
                         if self.is_reg_tainted(line.src_regs[1]) {
                             self.tainted_mem.insert(line.mem_write_addr2, Some(line.mem_write_val2));
-                        } else {
-                            self.tainted_mem.remove(&line.mem_write_addr2);
-                        }
+                        } else { self.tainted_mem.remove(&line.mem_write_addr2); }
                     } else {
-                        let src_t =
-                            line.num_src > 0 && self.is_reg_tainted(line.src_regs[0]);
-                        if src_t {
-                            self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
-                        } else {
-                            self.tainted_mem.remove(&line.mem_write_addr);
-                        }
+                        let src_t = line.num_src > 0 && self.is_reg_tainted(line.src_regs[0]);
+                        if src_t { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
+                        else { self.tainted_mem.remove(&line.mem_write_addr); }
                     }
                 }
             }
             Compare => {
                 let src_t = self.any_src_tainted(line);
-                if src_t {
-                    self.taint_reg(REG_NZCV);
-                } else {
-                    self.untaint_reg(REG_NZCV);
-                }
+                if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
             }
             Branch => {}
             Other => {
                 let src_t = self.any_src_tainted(line);
                 for i in 0..line.num_dst as usize {
-                    if src_t {
-                        self.taint_reg(line.dst_regs[i]);
-                    } else {
-                        self.untaint_reg(line.dst_regs[i]);
-                    }
+                    if src_t { self.taint_reg(line.dst_regs[i]); }
+                    else { self.untaint_reg(line.dst_regs[i]); }
                 }
                 if line.has_mem_write {
-                    if src_t {
-                        self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
-                    } else {
-                        self.tainted_mem.remove(&line.mem_write_addr);
-                    }
+                    if src_t { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
+                    else { self.tainted_mem.remove(&line.mem_write_addr); }
                 }
             }
         }
     }
 
-    fn propagate_backward(&mut self, line: &TraceLine, index: usize, bytes: &[u8]) {
-        use InsnCategory::*;
-        match line.category {
-            ExternalCall => {
-                self.untaint_caller_saved();
-            }
-            ImmLoad => {
-                for i in 0..line.num_dst as usize {
-                    if self.is_reg_tainted(line.dst_regs[i]) {
-                        self.untaint_reg(line.dst_regs[i]);
-                        let nid = normalize(line.dst_regs[i]) as usize;
-                        self.reg_has_expected_val[nid] = false;
-                    }
-                }
-            }
-            PartialModify => {}
-            DataMove | Arithmetic | Logic | ShiftExt | Bitfield | CondSelect => {
-                let dst_t = self.any_dst_tainted(line);
-                let nzcv_t = line.sets_flags && self.is_reg_tainted(REG_NZCV);
-                if dst_t || nzcv_t {
-                    // Capture expected value from the first tainted dst
-                    // before untainting. For DataMove the value transfers
-                    // directly to src; for others we can't reverse the
-                    // operation so we drop it.
-                    let propagate_val = if line.category == DataMove {
-                        let mut val: Option<u64> = None;
-                        for i in 0..line.num_dst as usize {
-                            let nid = normalize(line.dst_regs[i]) as usize;
-                            if self.reg_taint[nid] && self.reg_has_expected_val[nid] {
-                                val = Some(self.reg_expected_val[nid]);
-                                break;
-                            }
-                        }
-                        val
-                    } else {
-                        None
-                    };
-
-                    for i in 0..line.num_dst as usize {
-                        let nid = normalize(line.dst_regs[i]) as usize;
-                        self.reg_has_expected_val[nid] = false;
-                        self.untaint_reg(line.dst_regs[i]);
-                    }
-                    if nzcv_t {
-                        self.untaint_reg(REG_NZCV);
-                    }
-                    for i in 0..line.num_src as usize {
-                        self.taint_reg(line.src_regs[i]);
-                        // DataMove: value unchanged, propagate expected_val
-                        if let Some(val) = propagate_val {
-                            let nid = normalize(line.src_regs[i]) as usize;
-                            self.reg_expected_val[nid] = val;
-                            self.reg_has_expected_val[nid] = true;
-                        }
-                    }
-                }
-            }
-            Load => {
-                if line.has_mem_read2 && line.num_dst >= 2 {
-                    let t0 = self.is_reg_tainted(line.dst_regs[0]);
-                    let t1 = self.is_reg_tainted(line.dst_regs[1]);
-                    if t0 {
-                        self.untaint_reg(line.dst_regs[0]);
-                        let nid = normalize(line.dst_regs[0]) as usize;
-                        self.reg_has_expected_val[nid] = false;
-                        if line.has_mem_read {
-                            self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
-                        }
-                    }
-                    if t1 {
-                        self.untaint_reg(line.dst_regs[1]);
-                        let nid = normalize(line.dst_regs[1]) as usize;
-                        self.reg_has_expected_val[nid] = false;
-                        self.tainted_mem.insert(line.mem_read_addr2, Some(line.mem_read_val2));
-                    }
-                    // Also taint address-source registers with value-sensitive
-                    // expected values, so the address chain is also tracked.
-                    if t0 || t1 {
-                        self.taint_src_regs_with_values(line, bytes);
-                    }
-                } else {
-                    let mut dst_t = false;
-                    for i in 0..line.num_dst as usize {
-                        if self.is_reg_tainted(line.dst_regs[i]) {
-                            dst_t = true;
-                            self.untaint_reg(line.dst_regs[i]);
-                            let nid = normalize(line.dst_regs[i]) as usize;
-                            self.reg_has_expected_val[nid] = false;
-                        }
-                    }
-                    if dst_t {
-                        if line.has_mem_read {
-                            self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
-                        }
-                        // Also taint address-source registers with
-                        // value-sensitive expected values.
-                        self.taint_src_regs_with_values(line, bytes);
-                    }
-                }
-            }
-            Store => {
-                if line.has_mem_write {
-                    if line.has_mem_write2 && line.num_src >= 2 {
-                        if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr) {
-                            if let Some(expected) = entry {
-                                if expected != line.mem_write_val {
-                                    self.mismatches.push(ValueMismatch {
-                                        index,
-                                        mem_addr: line.mem_write_addr,
-                                        expected_val: expected,
-                                        actual_val: line.mem_write_val,
-                                    });
-                                }
-                            }
-                            self.taint_reg(line.src_regs[0]);
-                            // Propagate expected value: the register held
-                            // mem_write_val when this store executed.
-                            let nid = normalize(line.src_regs[0]) as usize;
-                            self.reg_expected_val[nid] = line.mem_write_val;
-                            self.reg_has_expected_val[nid] = true;
-                        }
-                        if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr2) {
-                            if let Some(expected) = entry {
-                                if expected != line.mem_write_val2 {
-                                    self.mismatches.push(ValueMismatch {
-                                        index,
-                                        mem_addr: line.mem_write_addr2,
-                                        expected_val: expected,
-                                        actual_val: line.mem_write_val2,
-                                    });
-                                }
-                            }
-                            self.taint_reg(line.src_regs[1]);
-                            let nid = normalize(line.src_regs[1]) as usize;
-                            self.reg_expected_val[nid] = line.mem_write_val2;
-                            self.reg_has_expected_val[nid] = true;
-                        }
-                    } else if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr) {
-                        if let Some(expected) = entry {
-                            if expected != line.mem_write_val {
-                                self.mismatches.push(ValueMismatch {
-                                    index,
-                                    mem_addr: line.mem_write_addr,
-                                    expected_val: expected,
-                                    actual_val: line.mem_write_val,
-                                });
-                            }
-                        }
-                        if line.num_src > 0 {
-                            self.taint_reg(line.src_regs[0]);
-                            let nid = normalize(line.src_regs[0]) as usize;
-                            self.reg_expected_val[nid] = line.mem_write_val;
-                            self.reg_has_expected_val[nid] = true;
-                        }
-                    }
-                }
-            }
-            Compare => {
-                if self.is_reg_tainted(REG_NZCV) {
-                    self.untaint_reg(REG_NZCV);
-                    for i in 0..line.num_src as usize {
-                        self.taint_reg(line.src_regs[i]);
-                    }
-                }
-            }
-            Branch => {}
-            Other => {
-                let dst_t = self.any_dst_tainted(line);
-                if dst_t {
-                    for i in 0..line.num_dst as usize {
-                        self.untaint_reg(line.dst_regs[i]);
-                    }
-                    for i in 0..line.num_src as usize {
-                        self.taint_reg(line.src_regs[i]);
-                    }
-                    if line.has_mem_read {
-                        self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
-                    }
-                }
-            }
-        }
+    fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
     }
+
+    // ───────── main entry points ─────────
 
     pub fn run(&mut self, lines: &[TraceLine], start_index: usize) {
         self.run_with_bytes(lines, start_index, &[]);
     }
 
-    /// Like `run`, but with access to the raw trace bytes for value-sensitive
-    /// backward tracking. When `bytes` is non-empty and the source has an
-    /// `expected_val`, the engine will verify that each candidate instruction's
-    /// output value for the tainted register matches before declaring it
-    /// "involved". This prevents false hits from unrelated overwrites of the
-    /// same register.
     pub fn run_with_bytes(
         &mut self,
         lines: &[TraceLine],
         start_index: usize,
-        bytes: &[u8],
+        _bytes: &[u8],
     ) {
         self.results.clear();
         self.mismatches.clear();
@@ -720,22 +563,13 @@ impl TaintEngine {
                     }
                     let line = &lines[i];
                     let mut involved = self.any_src_tainted(line);
-                    if !involved
-                        && line.category == InsnCategory::ExternalCall
-                        && self.any_caller_saved_tainted()
-                    {
+                    if !involved && line.category == InsnCategory::ExternalCall && self.any_caller_saved_tainted() {
                         involved = true;
                     }
-                    if !involved
-                        && line.has_mem_write
-                        && self.tainted_mem.contains_key(&line.mem_write_addr)
-                    {
+                    if !involved && line.has_mem_write && self.tainted_mem.contains_key(&line.mem_write_addr) {
                         involved = true;
                     }
-                    if !involved
-                        && line.has_mem_write2
-                        && self.tainted_mem.contains_key(&line.mem_write_addr2)
-                    {
+                    if !involved && line.has_mem_write2 && self.tainted_mem.contains_key(&line.mem_write_addr2) {
                         involved = true;
                     }
                     self.propagate_forward(line, i);
@@ -756,99 +590,112 @@ impl TaintEngine {
                     i += 1;
                 }
             }
+
             TrackMode::Backward => {
+                // Phase 1: forward scan to build dependency graph
+                let mut builder = DepGraphBuilder::new();
+                let (deps, reg_snapshot) = builder.build(lines, start_index, &self.cancel);
+
+                if self.is_cancelled() {
+                    self.stop_reason = StopReason::Cancelled;
+                    return;
+                }
+
+                // Determine BFS seeds based on TaintSource
+                let mut seeds: SmallVec<[u32; 4]> = SmallVec::new();
+
                 if self.source.skip_start_propagation {
-                    // The user is tracking a source register (e.g. address
-                    // offset of a Load). Just record the starting line and
-                    // keep the register tainted — don't run propagate_backward
-                    // which would untaint it and redirect taint to memory.
-                    self.record(start_index);
+                    // Track a specific src register: seed from its definition
+                    // before the start instruction.
+                    let target_reg = self.source.reg;
+                    let nid = normalize(target_reg) as usize;
+                    let def = reg_snapshot[nid];
+                    if def != NO_DEF {
+                        seeds.push(def);
+                    }
+                    // Also include start_index itself in results
+                    seeds.push(start_index as u32);
+                } else if self.source.is_mem {
+                    // Track memory: seed from the store that last wrote the addr
+                    if let Some(&def) = builder.mem_last_def.get(&self.source.mem_addr) {
+                        seeds.push(def);
+                    }
+                    seeds.push(start_index as u32);
                 } else {
-                    self.propagate_backward(&lines[start_index], start_index, bytes);
-                    self.record(start_index);
+                    // Track a dst register: BFS from start instruction
+                    seeds.push(start_index as u32);
                 }
-                let mut idle: u32 = 0;
-                let mut i = start_index as isize - 1;
-                while i >= 0 {
-                    if self.is_cancelled() {
-                        self.stop_reason = StopReason::Cancelled;
-                        self.results.reverse();
-                        return;
+
+                // Phase 2: BFS backward on dependency graph
+                let max_nodes = self.max_scan_distance as usize;
+                let visited = bfs_backward(&deps, &seeds, max_nodes, &self.cancel);
+
+                if self.is_cancelled() {
+                    self.stop_reason = StopReason::Cancelled;
+                    return;
+                }
+
+                if visited.len() >= max_nodes {
+                    self.stop_reason = StopReason::ScanLimitReached;
+                }
+
+                // Build results: for each visited instruction, record which
+                // dst registers it defines (shown as "tainted" in the UI).
+                for &idx in &visited {
+                    let line = &lines[idx];
+                    let mut snap = [false; 256];
+                    for j in 0..line.num_dst as usize {
+                        let nid = normalize(line.dst_regs[j]) as usize;
+                        snap[nid] = true;
                     }
-                    let line = &lines[i as usize];
-                    let mut involved = self.any_dst_tainted(line);
-                    if !involved
-                        && line.category == InsnCategory::ExternalCall
-                        && self.any_caller_saved_tainted()
-                    {
-                        involved = true;
+                    if line.sets_flags {
+                        snap[REG_NZCV as usize] = true;
                     }
-                    if !involved
-                        && line.has_mem_write
-                        && self.tainted_mem.contains_key(&line.mem_write_addr)
-                    {
-                        involved = true;
-                    }
-                    if !involved
-                        && line.has_mem_write2
-                        && self.tainted_mem.contains_key(&line.mem_write_addr2)
-                    {
-                        involved = true;
-                    }
-                    if !involved && line.sets_flags && self.is_reg_tainted(REG_NZCV) {
-                        involved = true;
-                    }
-                    // Value-sensitive check: if we have expected values and
-                    // raw bytes, verify that the instruction's output for the
-                    // tainted register matches the expected value. If not,
-                    // this instruction wrote a different value to the same
-                    // register — skip it.
-                    if involved && !bytes.is_empty() {
-                        involved = self.check_dst_values(line, bytes);
-                    }
-                    if involved {
-                        self.propagate_backward(line, i as usize, bytes);
-                        self.record(i as usize);
-                        idle = 0;
-                    } else {
-                        idle += 1;
-                        if idle >= self.max_scan_distance {
-                            self.stop_reason = StopReason::ScanLimitReached;
-                            break;
+                    if line.has_mem_write {
+                        // Mark store's source registers for display
+                        for j in 0..line.num_src as usize {
+                            let nid = normalize(line.src_regs[j]) as usize;
+                            snap[nid] = true;
                         }
                     }
-                    if self.tainted_reg_count == 0 && self.tainted_mem.is_empty() {
-                        self.stop_reason = StopReason::AllTaintCleared;
-                        break;
-                    }
-                    i -= 1;
+                    self.results.push(ResultEntry {
+                        index: idx,
+                        reg_snapshot: snap,
+                        mem_snapshot: Vec::new(),
+                    });
                 }
-                self.results.reverse();
-                if self.tainted_reg_count > 0 || !self.tainted_mem.is_empty() {
-                    let mut regs = Vec::new();
-                    for i in 0..256u16 {
-                        if self.reg_taint[i as usize] {
-                            regs.push(reg_name(i as u8).to_string());
+
+                // Detect remaining taint at boundary: if BFS reached
+                // instructions whose sources are undefined (NO_DEF),
+                // those registers come from before the trace.
+                let mut boundary_regs = Vec::new();
+                let boundary_mems: Vec<u64> = Vec::new();
+                for &idx in &visited {
+                    if idx == 0 {
+                        let line0 = &lines[0];
+                        for j in 0..line0.num_src as usize {
+                            let reg = line0.src_regs[j];
+                            if reg != REG_INVALID && reg != REG_XZR {
+                                let name = reg_name(reg).to_string();
+                                if !boundary_regs.contains(&name) {
+                                    boundary_regs.push(name);
+                                }
+                            }
                         }
                     }
-                    let mut mems: Vec<u64> = self.tainted_mem.keys().copied().collect();
-                    mems.sort_unstable();
-                    self.remaining_taint_at_boundary = Some(RemainingTaint { regs, mems });
+                }
+                if !boundary_regs.is_empty() || !boundary_mems.is_empty() {
+                    self.remaining_taint_at_boundary = Some(RemainingTaint {
+                        regs: boundary_regs,
+                        mems: boundary_mems,
+                    });
                 }
             }
         }
     }
 
-    fn is_cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    }
+    // ───────── format_result (unchanged) ─────────
 
-    /// Format the result the same way the C++ `write_result` does, returning a String.
-    /// `lines` are the parsed trace lines and `bytes` is the underlying buffer
-    /// they reference (used to read raw line text by file_offset/line_len).
     pub fn format_result(&self, lines: &[TraceLine], bytes: &[u8]) -> String {
         let mut out = String::new();
         let mode_s = match self.mode {
@@ -863,10 +710,6 @@ impl TaintEngine {
             out.push_str(reg_name(self.source.reg));
         }
         out.push('\n');
-        // 记录 engine 实际起点的"trace 行号 + 文件字节 offset"。
-        // 主视图在稀疏索引模式下显示的行号是估算的,与 parser 精确数
-        // `\n` 得到的行号可能差几行;日志里把精确起点写明,就能一眼
-        // 对上"我点的是 N 行"和"日志说从 M 行开始"。
         if let Some(idx) = self.start_index {
             if let Some(tl) = lines.get(idx) {
                 out.push_str(&format!(
@@ -875,22 +718,17 @@ impl TaintEngine {
                 ));
             }
         }
-        out.push_str(&format!(
-            "Total matched: {} instructions\n",
-            self.results.len()
-        ));
+        out.push_str(&format!("Total matched: {} instructions\n", self.results.len()));
         let stop = match self.stop_reason {
             StopReason::AllTaintCleared => "all taint cleared".to_string(),
             StopReason::ScanLimitReached => format!(
-                "scan limit reached ({} lines without propagation)",
-                self.max_scan_distance
+                "scan limit reached ({} nodes)", self.max_scan_distance
             ),
             StopReason::EndOfTrace => "end of trace".to_string(),
             StopReason::Cancelled => "cancelled".to_string(),
         };
         out.push_str(&format!("Stop reason: {}\n", stop));
 
-        // 如果反向追踪到边界仍有未清 taint,提示来源在 trace 之前
         if let Some(ref remaining) = self.remaining_taint_at_boundary {
             out.push_str("⚠ 以下 taint 在到达 trace 边界时仍未清除:\n");
             out.push_str(&format!("  寄存器: {}\n",
@@ -901,13 +739,10 @@ impl TaintEngine {
                 let mems: Vec<String> = remaining.mems.iter().map(|a| format!("0x{:x}", a)).collect();
                 out.push_str(&format!("  内存: {}\n", mems.join(", ")));
             }
-            // 从 trace 窗口的第一条指令提取函数名和 LR
             if !lines.is_empty() {
                 let first_line = read_raw_line(bytes, &lines[0]);
                 let first_line = first_line.trim();
-                // 函数名 = 第一个空格前的 "module!offset"
                 let func_id = first_line.split_whitespace().next().unwrap_or("?");
-                // LR = 在行里找 "LR=" 后面的值
                 let lr = first_line.find("LR=")
                     .map(|pos| {
                         let rest = &first_line[pos + 3..];
@@ -946,17 +781,13 @@ impl TaintEngine {
             let mut first = true;
             for i in 0..256u16 {
                 if entry.reg_snapshot[i as usize] {
-                    if !first {
-                        out.push_str(", ");
-                    }
+                    if !first { out.push_str(", "); }
                     out.push_str(reg_name(i as u8));
                     first = false;
                 }
             }
             for m in &entry.mem_snapshot {
-                if !first {
-                    out.push_str(", ");
-                }
+                if !first { out.push_str(", "); }
                 out.push_str(&format!("mem:0x{:x}", m));
                 first = false;
             }
