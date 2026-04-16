@@ -973,7 +973,7 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
             ui.add_space(4.0);
         }
 
-        if state.completed.is_none() {
+        let Some(completed) = state.completed.as_ref() else {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new("暂无污点追踪结果")
@@ -989,9 +989,7 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
                 .color(egui::Color32::from_rgb(150, 150, 150)),
             );
             return;
-        }
-
-        let completed = state.completed.as_ref().unwrap();
+        };
         render_panel_header_summary(ui, completed);
 
         // 如果反向追踪到 trace 边界仍有未清 taint,显示"来源在
@@ -1057,7 +1055,7 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
             }
         });
         let shown = state.filtered_indices.len();
-        let total = state.completed.as_ref().unwrap().hits.len();
+        let total = state.completed.as_ref().map_or(0, |c| c.hits.len());
         ui.label(
             egui::RichText::new(format!(
                 "显示 {} / {} 条 — 双击跳转到对应 trace 行",
@@ -1428,11 +1426,20 @@ fn rebuild_filter(state: &mut TaintState) {
             .iter()
             .enumerate()
             .filter_map(|(i, h)| {
-                if h.module_offset.to_lowercase().contains(&q)
-                    || h.addr.to_lowercase().contains(&q)
-                    || h.asm.to_lowercase().contains(&q)
-                    || h.raw_line.to_lowercase().contains(&q)
-                    || h.tainted_text.to_lowercase().contains(&q)
+                fn contains_ci(haystack: &str, needle: &str) -> bool {
+                    let n = needle.len();
+                    if n == 0 { return true; }
+                    if n > haystack.len() { return false; }
+                    let nb = needle.as_bytes();
+                    haystack.as_bytes().windows(n).any(|w| {
+                        w.iter().zip(nb).all(|(a, b)| a.to_ascii_lowercase() == *b)
+                    })
+                }
+                if contains_ci(&h.module_offset, &q)
+                    || contains_ci(&h.addr, &q)
+                    || contains_ci(&h.asm, &q)
+                    || contains_ci(&h.raw_line, &q)
+                    || contains_ci(&h.tainted_text, &q)
                     || h.line_number.to_string().contains(&q)
                 {
                     Some(i)
@@ -1454,7 +1461,8 @@ fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
     let row_h = text_h + 6.0;
 
     let total_rows = state.filtered_indices.len();
-    let hits_ptr: *const Vec<TaintHit> = &state.completed.as_ref().unwrap().hits;
+    let completed_ref = state.completed.as_ref()?;
+    let hits_ptr: *const Vec<TaintHit> = &completed_ref.hits;
     // SAFETY: `state.completed` is held for the duration of this function and
     // not mutated from inside the closures below; we only need a shared borrow.
     let hits: &Vec<TaintHit> = unsafe { &*hits_ptr };

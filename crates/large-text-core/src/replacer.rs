@@ -201,11 +201,8 @@ impl Replacer {
             };
 
             // Shift remaining bytes to start
-            let remaining_bytes = &buffer[shift_start..buffer_len];
-            let remaining_len = remaining_bytes.len();
-
-            let remaining_vec = remaining_bytes.to_vec();
-            buffer[0..remaining_len].copy_from_slice(&remaining_vec);
+            let remaining_len = buffer_len - shift_start;
+            buffer.copy_within(shift_start..buffer_len, 0);
 
             // Fill the rest of the buffer
             if !eof {

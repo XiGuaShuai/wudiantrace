@@ -593,12 +593,12 @@ impl TextViewerApp {
             return;
         }
 
-        let match_info = self.search_results[local_index].clone();
+        let sr = &self.search_results[local_index];
 
         // Queue the replacement
         self.pending_replacements.push(PendingReplacement {
-            offset: match_info.byte_offset,
-            old_len: match_info.match_len,
+            offset: sr.byte_offset,
+            old_len: sr.match_len,
             new_text: self.replace_query.clone(),
         });
         self.unsaved_changes = true;
@@ -613,7 +613,7 @@ impl TextViewerApp {
         let encoding = reader.encoding();
 
         if let Some(output_path) = rfd::FileDialog::new()
-            .set_file_name(input_path.file_name().unwrap().to_string_lossy())
+            .set_file_name(input_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())
             .save_file()
         {
             // If saving to the same file
@@ -716,7 +716,7 @@ impl TextViewerApp {
         if let Some(output_path) = rfd::FileDialog::new()
             .set_file_name(format!(
                 "{}.modified",
-                input_path.file_name().unwrap().to_string_lossy()
+                input_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             ))
             .save_file()
         {
