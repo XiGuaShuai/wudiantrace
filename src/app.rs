@@ -48,6 +48,11 @@ pub struct TextViewerApp {
     search_cancellation_token: Option<Arc<AtomicBool>>,
     search_count_done: bool,
     search_fetch_done: bool,
+    /// 本次搜索是否已经把视口自动跳转到第一条命中过了。
+    /// 并行 Find All 的 ChunkResult 是乱序到达的,如果每次
+    /// `search_results` 更新都触发自动跳转,视口会在文件不同
+    /// 位置之间来回跳。用这个 flag 保证只跳一次。
+    search_first_jump_done: bool,
 
     // Replace UI
     replace_in_progress: bool,
@@ -74,12 +79,24 @@ pub struct TextViewerApp {
     selected_encoding: &'static Encoding,
     show_encoding_selector: bool,
 
-    // Programmatic scroll control
+    // —— 滚动模型:`scroll_line` 是权威"视口顶行",整数驱动 ——
+    //
+    // egui 的 ScrollArea 内部用 f32 存 offset,在多 GB 字节位置上精度
+    // 只剩 ~30 行/quantum。滚轮小量 delta 会被 f32 直接吃掉,滚几格
+    // 不动然后突然跳一下 —— 就是"滚动不流畅"的根因。
+    //
+    // 这里把"滚到哪行"的真相攥在我们手里:每帧主动拦 smooth_scroll_delta,
+    // 按 line_height 换算成整数行更新 `scroll_line`,然后强制
+    // ScrollArea 的 vertical_scroll_offset 为 `scroll_line * line_height`。
+    // ScrollArea 只是反映我们的选择,精度由我们控制,滚轮每格 N 行
+    // 稳定一致。
+    /// 下一帧要跳到的顶行号。`scroll_to_row_centered` / `open_file` 等
+    /// "程序化跳转"路径写这里,`render_text_area` 开头 take 掉并覆盖
+    /// `scroll_line`。
     scroll_to_row: Option<usize>,
-    // Correction for f32 scroll precision issues in large files
-    scroll_correction: i64,
-    pending_scroll_target: Option<usize>,
-    last_scroll_offset: f32,
+    /// 亚整数行的滚轮像素累积。满一行(= `line_height`)就进位到
+    /// `scroll_line`,不满留着等下次滚轮凑够。这样连续慢滚不丢精度。
+    wheel_accum: f32,
 
     // Focus control
     focus_search_input: bool,
@@ -151,6 +168,7 @@ impl Default for TextViewerApp {
             search_cancellation_token: None,
             search_count_done: false,
             search_fetch_done: false,
+            search_first_jump_done: false,
             replace_in_progress: false,
             replace_message_rx: None,
             replace_cancellation_token: None,
@@ -166,9 +184,7 @@ impl Default for TextViewerApp {
             show_encoding_selector: false,
             focus_search_input: false,
             scroll_to_row: None,
-            scroll_correction: 0,
-            pending_scroll_target: None,
-            last_scroll_offset: 0.0,
+            wheel_accum: 0.0,
             unsaved_changes: false,
             pending_replacements: Vec::new(),
             open_start_time: None,
@@ -212,20 +228,17 @@ impl TextViewerApp {
     }
 
     /// 程序化滚动跳转,让 `target_row` 落到视口纵向**中部**而不是顶部。
-    /// 搜索命中 / 污点命中 / Go-To-Line 都走这条路径 —— 目标行带上下文
-    /// 可读性更好,不用再手动往上滚看前几行。
+    /// 搜索命中 / 污点命中 / Go-To-Line 都走这条路径。
     ///
-    /// **实现上不加新的滚动模式**:直接把 `target - visible_lines/2` 喂
-    /// 给现有的顶部对齐逻辑(含 `pending_scroll_target` + `scroll_correction`
-    /// 那套 f32 精度漂移补偿,多 GB 文件时关键)。`visible_lines` 由
-    /// `render_text_area` 每帧更新(首帧前默认 50),所以从第二帧开始就是
-    /// 真实视口高度。
+    /// 计算 `top = target - visible_lines/2`,塞进 `scroll_to_row`,下一帧
+    /// `render_text_area` 开头 take 掉并覆盖 `scroll_line`。顺便把
+    /// `wheel_accum` 清零 —— 跳转是"硬定位",之前攒着的半行滚轮增量
+    /// 不应该跨越跳转延续下去。
     fn scroll_to_row_centered(&mut self, target_row: usize) {
         let half = self.visible_lines.saturating_sub(1) / 2;
-        let adjusted = target_row.saturating_sub(half);
-        self.scroll_line = target_row;
-        self.scroll_to_row = Some(adjusted);
-        self.pending_scroll_target = Some(adjusted);
+        let top = target_row.saturating_sub(half);
+        self.scroll_to_row = Some(top);
+        self.wheel_accum = 0.0;
     }
 
     fn open_file(&mut self, path: PathBuf) {
@@ -240,9 +253,7 @@ impl TextViewerApp {
                     .index_file_async(self.file_reader.as_ref().unwrap().clone());
                 self.scroll_line = 0;
                 self.scroll_to_row = Some(0); // 新文件从顶部开始
-                self.scroll_correction = 0;
-                self.last_scroll_offset = 0.0;
-                self.pending_scroll_target = None;
+                self.wheel_accum = 0.0;
                 self.status_message = format!("Opened: {}", path.display());
                 self.search_engine.clear();
                 self.search_results.clear();
@@ -353,6 +364,7 @@ impl TextViewerApp {
         self.search_find_all = find_all;
         self.search_count_done = false;
         self.search_fetch_done = false;
+        self.search_first_jump_done = false;
 
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.search_cancellation_token = Some(cancel_token.clone());
@@ -492,10 +504,12 @@ impl TextViewerApp {
                             "Showing first match. Run Find All to see every result.".to_string();
                     }
 
-                    // Ensure we scroll to the first result if we haven't yet
-                    if self.scroll_to_row.is_none() && !self.search_results.is_empty() {
+                    // Ensure we scroll to the first result if we haven't yet.
+                    // 只跳一次(见 `search_first_jump_done` 字段注释)。
+                    if !self.search_first_jump_done && !self.search_results.is_empty() {
                         let target_line = self.line_at(self.search_results[0].byte_offset);
                         self.scroll_to_row_centered(target_line);
+                        self.search_first_jump_done = true;
                     }
                 } else {
                     self.status_message = "No matches found".to_string();
@@ -507,13 +521,14 @@ impl TextViewerApp {
                 // Only sort once per frame after processing all available chunks
                 self.search_results.sort_by_key(|r| r.byte_offset);
 
-                // Check for scroll update after sort
-                if self.scroll_to_row.is_none()
+                // Check for scroll update after sort. 同样只跳一次。
+                if !self.search_first_jump_done
                     && !self.search_results.is_empty()
                     && self.current_result_index == 0
                 {
                     let target_line = self.line_at(self.search_results[0].byte_offset);
                     self.scroll_to_row_centered(target_line);
+                    self.search_first_jump_done = true;
                 }
             }
         }
@@ -1256,16 +1271,54 @@ impl TextViewerApp {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .drag_to_scroll(true);
 
-                // 需要程序化跳转时,把 ScrollArea 的初始 vertical offset
-                // 置到 target 对应的像素位置。之前还配了一个
-                // `programmatic_scroll` 标志用于"用户滚动时 reset 掉
-                // scroll_correction",但那套逻辑会导致大文件跳转后一
-                // 滚轮就飞很远,现已拆除。`pending_scroll_target` 负责
-                // 精度补偿,这里只管粗定位。
+                // —— 整数滚动模型:我们自己数"到第几行了",不走 f32 ——
+                //
+                // 1) 程序化跳转:`scroll_to_row` 一旦有值就 take 并覆盖
+                //    到 `scroll_line`。搜索命中 / 污点命中 / Go-To-Line
+                //    等都走这条路。
                 if let Some(target_row) = self.scroll_to_row.take() {
-                    scroll_area =
-                        scroll_area.vertical_scroll_offset(target_row as f32 * line_height);
+                    self.scroll_line = target_row;
+                    self.wheel_accum = 0.0;
                 }
+
+                // 2) 鼠标滚轮:仅在指针落在中央文本区才算本面板的滚轮
+                //    事件(否则滚动工具栏、搜索面板等其它区域会误触)。
+                //    把本帧的 smooth_scroll_delta.y 消费掉,ScrollArea
+                //    就不再自己处理它 —— 避免"egui 按 f32 滚一档 + 我们
+                //    按整数滚一档"的双倍滚动。攒到 `line_height` 的整
+                //    数倍才进位到 `scroll_line`,不足的留下来等下次。
+                let panel_rect = ui.available_rect_before_wrap();
+                let pointer_in_panel = ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .map(|p| panel_rect.contains(p))
+                    .unwrap_or(false);
+                if pointer_in_panel {
+                    let wheel_dy = ctx.input_mut(|i| {
+                        let dy = i.smooth_scroll_delta.y;
+                        i.smooth_scroll_delta.y = 0.0;
+                        dy
+                    });
+                    // egui 约定 delta.y 正 = 内容下移(用户向上滚);
+                    // 我们的 `scroll_line` 是顶行号,向上滚对应行号变小。
+                    // 所以方向是 `scroll_line -= wheel / line_height`。
+                    self.wheel_accum -= wheel_dy;
+                    if line_height > 0.0 {
+                        let rows = (self.wheel_accum / line_height) as i64;
+                        if rows != 0 {
+                            let total = self.line_indexer.total_lines() as i64;
+                            let upper = (total - 1).max(0);
+                            let new_line = (self.scroll_line as i64 + rows).clamp(0, upper);
+                            self.scroll_line = new_line as usize;
+                            self.wheel_accum -= rows as f32 * line_height;
+                        }
+                    }
+                }
+
+                // 3) 每帧把 ScrollArea 的 offset 强制对齐到整数行。
+                //    ScrollArea 现在只负责画滚动条的 thumb 位置,它自己
+                //    对 f32 的量化不再影响我们显示哪一行。
+                scroll_area = scroll_area
+                    .vertical_scroll_offset(self.scroll_line as f32 * line_height);
 
                 let mut first_visible_row = None;
 
@@ -1274,16 +1327,13 @@ impl TextViewerApp {
                     line_height,
                     self.line_indexer.total_lines(),
                     |ui, row_range| {
-                        // Calculate scroll correction if we just jumped
-                        if let Some(target) = self.pending_scroll_target.take() {
-                            self.scroll_correction = target as i64 - row_range.start as i64;
-                        }
+                        // 不再信任 ScrollArea 给的 `row_range.start`(它
+                        // 来自 f32 offset,多 GB 文件上会量化抖动)。权威
+                        // 顶行号用我们自己的 `self.scroll_line`。
+                        // `row_range.len()` 还是用 ScrollArea 算的 —— 它
+                        // 基于视口高度,就是我们该渲染几行。
+                        let corrected_start_line = self.scroll_line;
 
-                        // Apply correction to find the actual start line we want to render
-                        let corrected_start_line =
-                            (row_range.start as i64 + self.scroll_correction).max(0) as usize;
-
-                        // Capture the first visible row (corrected)
                         if first_visible_row.is_none() {
                             first_visible_row = Some(corrected_start_line);
                         }
@@ -1650,24 +1700,32 @@ impl TextViewerApp {
                     },
                 );
 
-                // 跟踪滚动 offset,但**不**在滚轮触发时 reset
-                // scroll_correction。
+                // 滚动条被拖拽检测:
                 //
-                // 曾有一版在 !programmatic_scroll 且 offset 变化时把
-                // correction 置 0,理由是"用户滚过之后 correction 过
-                // 期了"。但代价巨大:多 GB 文件上,跳转时 correction
-                // 往往是 20-60 行(f32 滚动条精度限制),reset 那一帧
-                // 内容瞬间跳这么多行 —— 正是用户报的"滚轮一下飘很远"。
+                // 正常帧里 ScrollArea 的 offset 应该 ≈ `scroll_line *
+                // line_height`(我们上面 vertical_scroll_offset 强制过)。
+                // 如果本帧结束后 offset 显著大于/小于这个值,说明用户
+                // 直接拖拽了滚动条 thumb —— 反向折算成整数行写回
+                // `scroll_line`,下一帧重新锁定。
                 //
-                // 现在的策略:correction 一旦设置就跨帧保留,下一次
-                // 跳转(pending_scroll_target 被 take)才会重算。用户
-                // 在 target 附近小幅滚动,内容跟随预期移动;如果真
-                // 滚到文件开头这种极端位置,顶部会多出几十行空隙,
-                // 那是可接受的次要问题(比"飞一下"小多了)。
-                let current_offset = output.state.offset.y;
-                self.last_scroll_offset = current_offset;
+                // 容差取 2 × line_height:小于这个差值认为只是 f32 的
+                // 量化抖动,不作反应;超过则必然是用户操作。
+                let expected_offset = self.scroll_line as f32 * line_height;
+                let actual_offset = output.state.offset.y;
+                if line_height > 0.0
+                    && (actual_offset - expected_offset).abs() > 2.0 * line_height
+                {
+                    let total = self.line_indexer.total_lines() as i64;
+                    let upper = (total - 1).max(0);
+                    let dragged_line =
+                        (actual_offset / line_height).round() as i64;
+                    self.scroll_line = dragged_line.clamp(0, upper) as usize;
+                    self.wheel_accum = 0.0;
+                }
 
-                // Update scroll_line to match what was actually displayed
+                // 保底:把渲染实际选用的顶行写回 `scroll_line`,让状态栏
+                // "Line: N" 这种 UI 反映真实显示内容(正常情况下这里
+                // `scroll_line` 已经一致,这一步只是幂等保险)。
                 if let Some(first_row) = first_visible_row {
                     self.scroll_line = first_row;
                 }
