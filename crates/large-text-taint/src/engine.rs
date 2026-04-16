@@ -228,8 +228,11 @@ fn push_unique_reg(v: &mut SmallVec<[(u8, u32); 4]>, nid: u8, pred: u32) {
 /// Instead of blindly expanding all deps (which explodes through
 /// paired ldp/stp), this only follows dep edges whose output register
 /// or memory address is currently in the active (tracked) set.
+/// Phase 2a: taint-guided traversal to find the visited set.
+/// Only follows dep edges whose register/memory is in the active set.
+/// Returns (visited_indices_sorted, truncated).
 #[allow(clippy::too_many_arguments)]
-fn taint_guided_traverse(
+fn taint_guided_collect(
     lines: &[TraceLine],
     deps: &[InsnDeps],
     start_index: usize,
@@ -238,37 +241,26 @@ fn taint_guided_traverse(
     max_depth: u32,
     max_nodes: usize,
     cancel: &Option<Arc<AtomicBool>>,
-) -> (Vec<ResultEntry>, bool, [bool; 256], FxHashMap<u64, ()>) {
+) -> (Vec<usize>, bool) {
     let mut active_regs = [false; 256];
     let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
 
-    // Seed the active set
     if source.is_mem {
         active_mem.insert(source.mem_addr, ());
     } else {
         active_regs[normalize(source.reg) as usize] = true;
     }
 
-    // Queue: (instruction_index, depth)
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
     let mut visited = vec![false; deps.len()];
-    let mut results: Vec<(usize, [bool; 256], Vec<u64>)> = Vec::new();
+    let mut count: usize = 0;
     let mut truncated = false;
 
-    // Seed the queue
     if is_dst {
-        // Target is a dst: start from the instruction itself
         queue.push_back((start_index as u32, 0));
     } else {
-        // Target is a src: find its definition and start from there.
-        // Also include start_index in results (but don't expand its deps).
         visited[start_index] = true;
-        results.push((
-            start_index,
-            active_regs,
-            active_mem.keys().copied().collect(),
-        ));
-        // Find the predecessor for the target register
+        count += 1;
         let nid = normalize(source.reg);
         for &(rn, pred) in &deps[start_index].reg_preds {
             if rn == nid {
@@ -284,104 +276,58 @@ fn taint_guided_traverse(
         }
         let ui = idx as usize;
         if ui >= deps.len() || visited[ui] { continue; }
-        if depth > max_depth {
-            truncated = true;
-            continue;
-        }
-        if results.len() >= max_nodes {
-            truncated = true;
-            break;
-        }
+        if depth > max_depth { truncated = true; continue; }
+        if count >= max_nodes { truncated = true; break; }
 
         let line = &lines[ui];
 
-        // Check which outputs of this instruction are in the active set
+        // Check which outputs are active
         let mut dst_active = false;
         for j in 0..line.num_dst as usize {
-            if active_regs[normalize(line.dst_regs[j]) as usize] {
-                dst_active = true;
-            }
+            if active_regs[normalize(line.dst_regs[j]) as usize] { dst_active = true; }
         }
         let nzcv_active = line.sets_flags && active_regs[REG_NZCV as usize];
-        let mem_w_active = line.has_mem_write
-            && active_mem.contains_key(&line.mem_write_addr);
-        let mem_w2_active = line.has_mem_write2
-            && active_mem.contains_key(&line.mem_write_addr2);
+        let mem_w_active = line.has_mem_write && active_mem.contains_key(&line.mem_write_addr);
+        let mem_w2_active = line.has_mem_write2 && active_mem.contains_key(&line.mem_write_addr2);
 
         if !dst_active && !nzcv_active && !mem_w_active && !mem_w2_active {
-            continue; // This instruction's outputs aren't tracked
+            continue;
         }
 
         visited[ui] = true;
+        count += 1;
 
         // Propagate: remove outputs, add inputs
         if dst_active {
-            for j in 0..line.num_dst as usize {
-                active_regs[normalize(line.dst_regs[j]) as usize] = false;
-            }
+            for j in 0..line.num_dst as usize { active_regs[normalize(line.dst_regs[j]) as usize] = false; }
         }
-        if nzcv_active {
-            active_regs[REG_NZCV as usize] = false;
-        }
-        if mem_w_active {
-            active_mem.remove(&line.mem_write_addr);
-        }
-        if mem_w2_active {
-            active_mem.remove(&line.mem_write_addr2);
-        }
+        if nzcv_active { active_regs[REG_NZCV as usize] = false; }
+        if mem_w_active { active_mem.remove(&line.mem_write_addr); }
+        if mem_w2_active { active_mem.remove(&line.mem_write_addr2); }
 
-        // Add inputs based on category
         match line.category {
-            InsnCategory::ImmLoad | InsnCategory::ExternalCall => {
-                // No data inputs
-            }
+            InsnCategory::ImmLoad | InsnCategory::ExternalCall => {}
             InsnCategory::Load => {
-                // Memory source
-                if line.has_mem_read {
-                    active_mem.insert(line.mem_read_addr, ());
-                }
-                if line.has_mem_read2 {
-                    active_mem.insert(line.mem_read_addr2, ());
-                }
-                // Address registers
+                if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
+                if line.has_mem_read2 { active_mem.insert(line.mem_read_addr2, ()); }
                 for j in 0..line.num_src as usize {
                     active_regs[normalize(line.src_regs[j]) as usize] = true;
                 }
             }
             InsnCategory::Store => {
-                // Only value source register(s), not address
-                if mem_w_active && line.num_src > 0 {
-                    active_regs[normalize(line.src_regs[0]) as usize] = true;
-                }
-                if mem_w2_active && line.num_src > 1 {
-                    active_regs[normalize(line.src_regs[1]) as usize] = true;
-                }
+                if mem_w_active && line.num_src > 0 { active_regs[normalize(line.src_regs[0]) as usize] = true; }
+                if mem_w2_active && line.num_src > 1 { active_regs[normalize(line.src_regs[1]) as usize] = true; }
             }
             InsnCategory::CondSelect => {
-                // Data sources only, not NZCV
-                for j in 0..line.num_src as usize {
-                    active_regs[normalize(line.src_regs[j]) as usize] = true;
-                }
+                for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
             }
             _ => {
-                for j in 0..line.num_src as usize {
-                    active_regs[normalize(line.src_regs[j]) as usize] = true;
-                }
-                if line.has_mem_read {
-                    active_mem.insert(line.mem_read_addr, ());
-                }
+                for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
             }
         }
 
-        // Snapshot
-        results.push((
-            ui,
-            active_regs,
-            active_mem.keys().copied().collect(),
-        ));
-
-        // Queue ONLY the predecessors for registers/memory now in active.
-        // This is the key difference from blind BFS.
+        // Queue only active predecessors
         let d = &deps[ui];
         for &(nid, pred) in &d.reg_preds {
             if active_regs[nid as usize] && !visited[pred as usize] {
@@ -393,29 +339,83 @@ fn taint_guided_traverse(
                 queue.push_back((pred, depth + 1));
             }
         }
-        // Also queue NZCV deps if NZCV is active
-        if active_regs[REG_NZCV as usize] {
-            for &(nid, pred) in &d.reg_preds {
-                if nid == REG_NZCV && !visited[pred as usize] {
-                    queue.push_back((pred, depth + 1));
+    }
+
+    let mut result = Vec::with_capacity(count);
+    for (i, &v) in visited.iter().enumerate() {
+        if v { result.push(i); }
+    }
+    (result, truncated)
+}
+
+/// Phase 2b: rebuild taint snapshots in descending instruction order
+/// over the visited set. This produces correct sequential taint evolution.
+fn rebuild_snapshots(
+    lines: &[TraceLine],
+    visited: &[usize],
+    source: &TaintSource,
+) -> (Vec<ResultEntry>, [bool; 256], FxHashMap<u64, ()>) {
+    let mut active_regs = [false; 256];
+    let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
+
+    if source.is_mem {
+        active_mem.insert(source.mem_addr, ());
+    } else {
+        active_regs[normalize(source.reg) as usize] = true;
+    }
+
+    let mut entries: Vec<ResultEntry> = Vec::with_capacity(visited.len());
+
+    // Process in DESCENDING order (target → earliest)
+    for &idx in visited.iter().rev() {
+        let line = &lines[idx];
+
+        let mut dst_active = false;
+        for j in 0..line.num_dst as usize {
+            if active_regs[normalize(line.dst_regs[j]) as usize] { dst_active = true; }
+        }
+        let nzcv_active = line.sets_flags && active_regs[REG_NZCV as usize];
+        let mem_w_active = line.has_mem_write && active_mem.contains_key(&line.mem_write_addr);
+        let mem_w2_active = line.has_mem_write2 && active_mem.contains_key(&line.mem_write_addr2);
+
+        if dst_active || nzcv_active || mem_w_active || mem_w2_active {
+            if dst_active {
+                for j in 0..line.num_dst as usize { active_regs[normalize(line.dst_regs[j]) as usize] = false; }
+            }
+            if nzcv_active { active_regs[REG_NZCV as usize] = false; }
+            if mem_w_active { active_mem.remove(&line.mem_write_addr); }
+            if mem_w2_active { active_mem.remove(&line.mem_write_addr2); }
+
+            match line.category {
+                InsnCategory::ImmLoad | InsnCategory::ExternalCall => {}
+                InsnCategory::Load => {
+                    if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
+                    if line.has_mem_read2 { active_mem.insert(line.mem_read_addr2, ()); }
+                    for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                }
+                InsnCategory::Store => {
+                    if mem_w_active && line.num_src > 0 { active_regs[normalize(line.src_regs[0]) as usize] = true; }
+                    if mem_w2_active && line.num_src > 1 { active_regs[normalize(line.src_regs[1]) as usize] = true; }
+                }
+                InsnCategory::CondSelect => {
+                    for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                }
+                _ => {
+                    for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                    if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
                 }
             }
         }
+
+        entries.push(ResultEntry {
+            index: idx,
+            reg_snapshot: active_regs,
+            mem_snapshot: active_mem.keys().copied().collect(),
+        });
     }
 
-    // Sort by instruction index (ascending)
-    results.sort_by_key(|r| r.0);
-
-    let entries = results
-        .into_iter()
-        .map(|(idx, regs, mems)| ResultEntry {
-            index: idx,
-            reg_snapshot: regs,
-            mem_snapshot: mems,
-        })
-        .collect();
-
-    (entries, truncated, active_regs, active_mem)
+    entries.reverse();
+    (entries, active_regs, active_mem)
 }
 
 // ───────────────────────── engine ─────────────────────────
@@ -683,13 +683,12 @@ impl TaintEngine {
                         .any(|j| normalize(start_line.dst_regs[j]) as usize == tnid)
                 };
 
-                // Phase 2: taint-guided traversal
+                // Phase 2a: taint-guided traversal → visited set
                 let max_nodes = self.max_scan_distance as usize;
-                let (entries, truncated, remaining_regs, remaining_mem) =
-                    taint_guided_traverse(
-                        lines, &deps, start_index, &self.source,
-                        is_dst, self.max_depth, max_nodes, &self.cancel,
-                    );
+                let (visited, truncated) = taint_guided_collect(
+                    lines, &deps, start_index, &self.source,
+                    is_dst, self.max_depth, max_nodes, &self.cancel,
+                );
 
                 if self.is_cancelled() { self.stop_reason = StopReason::Cancelled; return; }
 
@@ -697,6 +696,9 @@ impl TaintEngine {
                     self.stop_reason = StopReason::ScanLimitReached;
                 }
 
+                // Phase 2b: rebuild snapshots in correct sequential order
+                let (entries, remaining_regs, remaining_mem) =
+                    rebuild_snapshots(lines, &visited, &self.source);
                 self.results = entries;
 
                 // Build boundary taint
