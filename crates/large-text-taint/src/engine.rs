@@ -716,7 +716,8 @@ impl TaintEngine {
 
                 // Determine BFS seeds
                 let seeds = self.compute_bfs_seeds(
-                    start_index, &reg_snapshot, &builder.mem_last_def,
+                    &lines[start_index], start_index, &reg_snapshot,
+                    &builder.mem_last_def,
                 );
 
                 // Phase 2: depth-limited BFS
@@ -733,13 +734,10 @@ impl TaintEngine {
                     self.stop_reason = StopReason::ScanLimitReached;
                 }
 
-                // For skip_start_propagation: ensure start_index is in
-                // the results even though it wasn't a BFS seed (we don't
-                // want to expand its full deps, only show it).
-                if self.source.skip_start_propagation
-                    && !visited.contains(&start_index)
-                {
-                    // Insert in sorted position
+                // Ensure start_index is in results even if it wasn't a
+                // BFS seed (happens when target is a src register of the
+                // start instruction, e.g. tracking x8 from `str x8, [x19]`).
+                if !visited.contains(&start_index) {
                     let pos = visited.partition_point(|&x| x < start_index);
                     visited.insert(pos, start_index);
                 }
@@ -754,8 +752,15 @@ impl TaintEngine {
     }
 
     /// Compute BFS seed indices based on the TaintSource type.
+    ///
+    /// Key logic: if the target register is a DST of the start instruction,
+    /// seed from start_index (expanding all its deps). Otherwise the target
+    /// is a SRC (e.g. tracking x8 from `str x8, [x19]`) — seed only from
+    /// `reg_last_def[target_reg]` to avoid expanding unrelated deps like
+    /// the Store's address registers.
     fn compute_bfs_seeds(
         &self,
+        start_line: &TraceLine,
         start_index: usize,
         reg_snapshot: &[u32; 256],
         mem_last_def: &FxHashMap<u64, u32>,
@@ -763,22 +768,38 @@ impl TaintEngine {
         let mut seeds = SmallVec::<[u32; 4]>::new();
 
         if self.source.skip_start_propagation {
-            // Track a specific src register: seed ONLY from its
-            // definition. start_index is added to results separately
-            // (not as a BFS seed) to avoid expanding all its deps.
+            // Explicitly tracking a source register (e.g. address offset)
             let nid = normalize(self.source.reg) as usize;
             let def = reg_snapshot[nid];
             if def != NO_DEF {
                 seeds.push(def);
             }
         } else if self.source.is_mem {
-            // Track memory: seed from the store that last wrote the addr
             if let Some(&def) = mem_last_def.get(&self.source.mem_addr) {
                 seeds.push(def);
             }
         } else {
-            // Track a dst register: BFS from start instruction
-            seeds.push(start_index as u32);
+            // Check: is the target register a DST of the start instruction?
+            let target_nid = normalize(self.source.reg) as usize;
+            let mut is_dst = false;
+            for j in 0..start_line.num_dst as usize {
+                if normalize(start_line.dst_regs[j]) as usize == target_nid {
+                    is_dst = true;
+                    break;
+                }
+            }
+
+            if is_dst {
+                // Target is a destination: expand from the instruction
+                seeds.push(start_index as u32);
+            } else {
+                // Target is a source (e.g. x8 in `str x8, [x19]`):
+                // seed from its definition only, skip address deps.
+                let def = reg_snapshot[target_nid];
+                if def != NO_DEF {
+                    seeds.push(def);
+                }
+            }
         }
 
         seeds
