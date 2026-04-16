@@ -1695,8 +1695,9 @@ impl TextViewerApp {
                                     ui.separator();
 
                                     if let Some(tl) = &parsed {
-                                        let targets = crate::taint::collect_targets(tl);
-                                        let addr_targets = crate::taint::collect_addr_source_targets(tl);
+                                        let raw_line = line_text.as_bytes();
+                                        let targets = crate::taint::collect_targets(tl, raw_line);
+                                        let addr_targets = crate::taint::collect_addr_source_targets(tl, raw_line);
                                         if targets.is_empty() {
                                             ui.label(
                                                 egui::RichText::new(

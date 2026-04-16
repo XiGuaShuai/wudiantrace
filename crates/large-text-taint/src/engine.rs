@@ -32,6 +32,11 @@ pub struct TaintSource {
     /// register of the starting instruction (e.g. the address-offset register
     /// of a Load) rather than a *destination* register.
     pub skip_start_propagation: bool,
+    /// Optional expected register value for value-sensitive backward tracking.
+    /// When set, the engine will skip instructions whose output value for the
+    /// tracked register doesn't match, avoiding false hits from unrelated
+    /// overwrites of the same register.
+    pub expected_val: Option<u64>,
 }
 
 impl TaintSource {
@@ -41,6 +46,16 @@ impl TaintSource {
             mem_addr: 0,
             is_mem: false,
             skip_start_propagation: false,
+            expected_val: None,
+        }
+    }
+    pub fn from_reg_with_val(reg: RegId, val: u64) -> Self {
+        Self {
+            reg,
+            mem_addr: 0,
+            is_mem: false,
+            skip_start_propagation: false,
+            expected_val: Some(val),
         }
     }
     pub fn from_mem(addr: u64) -> Self {
@@ -49,6 +64,7 @@ impl TaintSource {
             mem_addr: addr,
             is_mem: true,
             skip_start_propagation: false,
+            expected_val: None,
         }
     }
     /// Create a source that tracks a register but skips backward propagation
@@ -61,6 +77,16 @@ impl TaintSource {
             mem_addr: 0,
             is_mem: false,
             skip_start_propagation: true,
+            expected_val: None,
+        }
+    }
+    pub fn from_reg_as_source_with_val(reg: RegId, val: u64) -> Self {
+        Self {
+            reg,
+            mem_addr: 0,
+            is_mem: false,
+            skip_start_propagation: true,
+            expected_val: Some(val),
         }
     }
 }
@@ -90,6 +116,10 @@ pub struct TaintEngine {
 
     reg_taint: [bool; 256],
     tainted_reg_count: i32,
+    /// Value-sensitive backward tracking: expected output value per register.
+    /// Only registers with `reg_has_expected_val[id] == true` are checked.
+    reg_expected_val: [u64; 256],
+    reg_has_expected_val: [bool; 256],
     tainted_mem: FxHashMap<u64, Option<u64>>,
     results: Vec<ResultEntry>,
     mismatches: Vec<ValueMismatch>,
@@ -131,6 +161,8 @@ impl TaintEngine {
             cancel: None,
             reg_taint: [false; 256],
             tainted_reg_count: 0,
+            reg_expected_val: [0; 256],
+            reg_has_expected_val: [false; 256],
             tainted_mem: FxHashMap::default(),
             results: Vec::new(),
             mismatches: Vec::new(),
@@ -177,6 +209,8 @@ impl TaintEngine {
         self.source = source;
         self.reg_taint = [false; 256];
         self.tainted_reg_count = 0;
+        self.reg_expected_val = [0; 256];
+        self.reg_has_expected_val = [false; 256];
         self.tainted_mem.clear();
         self.results.clear();
         self.mismatches.clear();
@@ -186,6 +220,11 @@ impl TaintEngine {
             self.tainted_mem.insert(source.mem_addr, None);
         } else {
             self.taint_reg(source.reg);
+            if let Some(val) = source.expected_val {
+                let nid = normalize(source.reg) as usize;
+                self.reg_expected_val[nid] = val;
+                self.reg_has_expected_val[nid] = true;
+            }
         }
     }
 
@@ -199,6 +238,38 @@ impl TaintEngine {
             self.reg_taint[nid] = true;
             self.tainted_reg_count += 1;
         }
+    }
+
+    /// Check whether an instruction's output values for tainted dst registers
+    /// match the expected values. Returns `true` if the instruction should
+    /// still be considered "involved", `false` if values mismatch (= skip).
+    ///
+    /// If no expected value is set for any tainted dst register, returns `true`
+    /// (no filtering). Only checks registers that have both taint AND an
+    /// expected value.
+    fn check_dst_values(&self, line: &TraceLine, bytes: &[u8]) -> bool {
+        for d in 0..line.num_dst as usize {
+            let nid = normalize(line.dst_regs[d]) as usize;
+            if !self.reg_taint[nid] || !self.reg_has_expected_val[nid] {
+                continue;
+            }
+            // Parse the output value from the raw trace line
+            let off = line.file_offset as usize;
+            let len = line.line_len as usize;
+            if off.saturating_add(len) > bytes.len() {
+                continue; // can't read raw line, skip check
+            }
+            let raw = &bytes[off..off + len];
+            if let Some(actual_val) =
+                crate::parser::parse_output_reg_val(raw, line.dst_regs[d])
+            {
+                if actual_val != self.reg_expected_val[nid] {
+                    return false; // value mismatch → skip this instruction
+                }
+            }
+            // If we can't parse the value, be conservative and allow it
+        }
+        true // no mismatch found (or nothing to check)
     }
 
     #[inline]
@@ -534,6 +605,21 @@ impl TaintEngine {
     }
 
     pub fn run(&mut self, lines: &[TraceLine], start_index: usize) {
+        self.run_with_bytes(lines, start_index, &[]);
+    }
+
+    /// Like `run`, but with access to the raw trace bytes for value-sensitive
+    /// backward tracking. When `bytes` is non-empty and the source has an
+    /// `expected_val`, the engine will verify that each candidate instruction's
+    /// output value for the tainted register matches before declaring it
+    /// "involved". This prevents false hits from unrelated overwrites of the
+    /// same register.
+    pub fn run_with_bytes(
+        &mut self,
+        lines: &[TraceLine],
+        start_index: usize,
+        bytes: &[u8],
+    ) {
         self.results.clear();
         self.mismatches.clear();
         self.stop_reason = StopReason::EndOfTrace;
@@ -634,7 +720,22 @@ impl TaintEngine {
                     if !involved && line.sets_flags && self.is_reg_tainted(REG_NZCV) {
                         involved = true;
                     }
+                    // Value-sensitive check: if we have expected values and
+                    // raw bytes, verify that the instruction's output for the
+                    // tainted register matches the expected value. If not,
+                    // this instruction wrote a different value to the same
+                    // register — skip it.
+                    if involved && !bytes.is_empty() {
+                        involved = self.check_dst_values(line, bytes);
+                    }
                     if involved {
+                        // Clear expected values for all dst registers about to
+                        // be processed — after the first hop, further tracking
+                        // is name-based only.
+                        for d in 0..line.num_dst as usize {
+                            let nid = normalize(line.dst_regs[d]) as usize;
+                            self.reg_has_expected_val[nid] = false;
+                        }
                         self.propagate_backward(line, i as usize);
                         self.record(i as usize);
                         idle = 0;

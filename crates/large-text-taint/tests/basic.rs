@@ -248,3 +248,67 @@ MEM R 0x76ff3bc010 [8 bytes]: 5c c2 0e a0 76 00 00 00  v
     assert_eq!(results[0].index, 0, "first hit = csel");
     assert_eq!(results[1].index, 1, "second hit = ldr");
 }
+
+/// Value-sensitive backward tracking: when the tracked register is
+/// overwritten with a DIFFERENT value, those writes should be skipped.
+///
+///   line 0: mov w8, #0xAA   → x8 = 0xAA (wrong)
+///   line 1: mov w8, #0xCC   → x8 = 0xCC (wrong)
+///   line 2: mov w8, #0xBB   → x8 = 0xBB (correct)
+///   line 3: add x0, x8, x1  → uses x8=0xBB
+///
+/// Tracking x8=0xBB backward from line 3 should only hit line 2.
+#[test]
+fn backward_value_sensitive_skips_wrong_values() {
+    // Three instructions all write x8, but with different values.
+    // Only line 2 writes x8=0xBB which is what we're looking for.
+    let input = b"\
+libtiny.so!1000 0x70001000: \"\tmov\tw8, #0xAA\" => W8=0xAA
+libtiny.so!1004 0x70001004: \"\tmov\tw8, #0xCC\" => W8=0xCC
+libtiny.so!1008 0x70001008: \"\tmov\tw8, #0xBB\" => W8=0xBB
+libtiny.so!100c 0x7000100c: \"\tadd\tx0, x8, x1\" X8=0xBB, X1=0x10 => X0=0xCB
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(input);
+    let lines = p.lines();
+    assert_eq!(lines.len(), 4);
+
+    let x8 = parse_reg_name(b"x8");
+
+    let no_val_count = {
+        let mut e = TaintEngine::new();
+        e.set_mode(TrackMode::Backward);
+        e.set_source(TaintSource::from_reg(x8));
+        e.set_max_scan_distance(1000);
+        e.run(lines, 3);
+        e.results().len()
+    };
+
+    // WITH value-sensitive: from_reg_as_source + expected_val = track x8=0xBB
+    let mut engine2 = TaintEngine::new();
+    engine2.set_mode(TrackMode::Backward);
+    engine2.set_source(TaintSource::from_reg_as_source_with_val(x8, 0xBB));
+    engine2.set_max_scan_distance(1000);
+    engine2.run_with_bytes(lines, 3, input);
+
+    let results = engine2.results();
+    eprintln!("value-sensitive results: {}", results.len());
+    for r in results {
+        eprintln!("  hit index={} (line {})", r.index, lines[r.index].line_number);
+    }
+    // Only line 2 (mov w8, #0xBB) should match, plus the starting line
+    // Line 0 (0xAA) and line 1 (0xCC) should be skipped
+    assert!(
+        results.iter().any(|r| r.index == 2),
+        "should hit mov w8, #0xBB"
+    );
+    assert!(
+        !results.iter().any(|r| r.index == 0),
+        "should NOT hit mov w8, #0xAA"
+    );
+    assert!(
+        !results.iter().any(|r| r.index == 1),
+        "should NOT hit mov w8, #0xCC"
+    );
+    let _ = no_val_count; // suppress unused warning
+}

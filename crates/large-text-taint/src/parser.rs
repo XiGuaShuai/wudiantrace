@@ -596,6 +596,84 @@ pub fn read_raw_line(bytes: &[u8], tl: &TraceLine) -> String {
     String::from_utf8_lossy(&bytes[off..off + len]).into_owned()
 }
 
+/// Parse the output value of a specific register from a raw trace line.
+///
+/// Trace format: `... "asm" REG=val, REG=val => REG=val, REG=val`
+///
+/// This function finds the `=>` separator and then searches for `REGNAME=0xVAL`
+/// in the output section. Returns `None` if the register is not found or the
+/// line doesn't have an `=>` section.
+///
+/// `target_reg` is a normalized register ID (e.g. 27 for x27/w27).
+pub fn parse_output_reg_val(raw_line: &[u8], target_reg: crate::reg::RegId) -> Option<u64> {
+    // Find "=>" separator
+    let arrow_pos = memmem::find(raw_line, b"=>")?;
+    let after_arrow = &raw_line[arrow_pos + 2..];
+    parse_reg_val_in(after_arrow, target_reg)
+}
+
+/// Parse the input value of a specific register from a raw trace line.
+///
+/// Searches in the section BEFORE `=>` for `REGNAME=0xVAL`.
+pub fn parse_input_reg_val(raw_line: &[u8], target_reg: crate::reg::RegId) -> Option<u64> {
+    // Find closing quote, then search between quote and "=>"
+    let quote_pos = memchr(b'"', raw_line)
+        .and_then(|first| memchr(b'"', &raw_line[first + 1..]).map(|p| first + 1 + p))?;
+    let after_quote = &raw_line[quote_pos + 1..];
+    let arrow_pos = memmem::find(after_quote, b"=>").unwrap_or(after_quote.len());
+    let input_section = &after_quote[..arrow_pos];
+    parse_reg_val_in(input_section, target_reg)
+}
+
+/// Search for `REGNAME=0xVAL` or `REGNAME=VAL` in `section` and return the
+/// value if the register matches `target_reg` (after normalization).
+fn parse_reg_val_in(section: &[u8], target_reg: crate::reg::RegId) -> Option<u64> {
+    let target_norm = crate::reg::normalize(target_reg) as usize;
+    let mut i = 0;
+    while i < section.len() {
+        // Skip to a letter that could start a register name
+        if !section[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        // Extract token until '='
+        let tok_start = i;
+        while i < section.len() && section[i] != b'=' {
+            if section[i] == b',' || section[i] == b' ' || section[i] == b'\n' {
+                break;
+            }
+            i += 1;
+        }
+        if i >= section.len() || section[i] != b'=' {
+            i += 1;
+            continue;
+        }
+        let tok = &section[tok_start..i];
+        i += 1; // skip '='
+        // Skip optional "0x" prefix
+        let val_start = if i + 1 < section.len() && section[i] == b'0' && section[i + 1] == b'x' {
+            i + 2
+        } else {
+            i
+        };
+        // Read hex digits
+        let mut val_end = val_start;
+        while val_end < section.len() && section[val_end].is_ascii_hexdigit() {
+            val_end += 1;
+        }
+        if val_end == val_start {
+            continue;
+        }
+        // Check if this register matches our target
+        let rid = parse_reg_name(tok);
+        if rid != crate::reg::REG_INVALID && crate::reg::normalize(rid) as usize == target_norm {
+            return Some(parse_hex_safe(&section[val_start..val_end]));
+        }
+        i = val_end;
+    }
+    None
+}
+
 fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) {
     let mut tok = [0u8; 8];
     for j in 0..segment.len() {

@@ -429,7 +429,7 @@ fn run_job(job: JobConfig) {
     engine.set_source(source);
     engine.set_max_scan_distance(scan_limit);
     engine.set_cancel_token(cancel.clone());
-    engine.run(parser.lines(), start_index);
+    engine.run_with_bytes(parser.lines(), start_index, bytes);
 
     if cancel.load(Ordering::Relaxed) && engine.stop_reason() == StopReason::Cancelled {
         let _ = tx.send(TaintMessage::Error("已取消".to_string()));
@@ -616,24 +616,38 @@ fn offset_of_line(bytes: &[u8], line_number: u32) -> Option<u64> {
 /// Enumerate distinct register + memory targets referenced by a single parsed
 /// trace line, preserving insertion order. Used by the right-click menu to
 /// offer one-click "forward/backward from <reg>" entries.
-pub fn collect_targets(tl: &TraceLine) -> Vec<TaintSource> {
+pub fn collect_targets(tl: &TraceLine, raw_line: &[u8]) -> Vec<TaintSource> {
     let mut out: Vec<TaintSource> = Vec::new();
     let mut seen_reg: [bool; 256] = [false; 256];
-    let push_reg = |id: u8, out: &mut Vec<TaintSource>, seen: &mut [bool; 256]| {
+    // For dst registers: use the OUTPUT value (after =>) for value-sensitive tracking
+    for i in 0..tl.num_dst as usize {
+        let id = tl.dst_regs[i];
         if id == REG_INVALID {
-            return;
+            continue;
         }
         let n = large_text_taint::reg::normalize(id) as usize;
-        if !seen[n] {
-            seen[n] = true;
-            out.push(TaintSource::from_reg(id));
+        if !seen_reg[n] {
+            seen_reg[n] = true;
+            let val = large_text_taint::parser::parse_output_reg_val(raw_line, id);
+            let mut src = TaintSource::from_reg(id);
+            src.expected_val = val;
+            out.push(src);
         }
-    };
-    for i in 0..tl.num_dst as usize {
-        push_reg(tl.dst_regs[i], &mut out, &mut seen_reg);
     }
+    // For src registers: use the INPUT value (before =>) for value-sensitive tracking
     for i in 0..tl.num_src as usize {
-        push_reg(tl.src_regs[i], &mut out, &mut seen_reg);
+        let id = tl.src_regs[i];
+        if id == REG_INVALID {
+            continue;
+        }
+        let n = large_text_taint::reg::normalize(id) as usize;
+        if !seen_reg[n] {
+            seen_reg[n] = true;
+            let val = large_text_taint::parser::parse_input_reg_val(raw_line, id);
+            let mut src = TaintSource::from_reg(id);
+            src.expected_val = val;
+            out.push(src);
+        }
     }
     if tl.has_mem_read {
         out.push(TaintSource::from_mem(tl.mem_read_addr));
@@ -658,7 +672,7 @@ pub fn collect_targets(tl: &TraceLine) -> Vec<TaintSource> {
 /// Example: `ldr x8, [x27, x8]` → returns [x27, x8] as address sources.
 /// The user can pick x8 here to track *where the address offset came from*,
 /// separate from tracking *what value was loaded*.
-pub fn collect_addr_source_targets(tl: &TraceLine) -> Vec<TaintSource> {
+pub fn collect_addr_source_targets(tl: &TraceLine, raw_line: &[u8]) -> Vec<TaintSource> {
     use large_text_taint::trace::InsnCategory;
     if !matches!(tl.category, InsnCategory::Load | InsnCategory::Store) {
         return Vec::new();
@@ -673,7 +687,10 @@ pub fn collect_addr_source_targets(tl: &TraceLine) -> Vec<TaintSource> {
         let n = large_text_taint::reg::normalize(id) as usize;
         if !seen_reg[n] {
             seen_reg[n] = true;
-            out.push(TaintSource::from_reg_as_source(id));
+            let val = large_text_taint::parser::parse_input_reg_val(raw_line, id);
+            let mut src = TaintSource::from_reg_as_source(id);
+            src.expected_val = val;
+            out.push(src);
         }
     }
     out
@@ -706,6 +723,8 @@ fn parse_source(s: &str) -> Result<TaintSource, String> {
 fn format_source_label(src: &TaintSource) -> String {
     if src.is_mem {
         format!("mem:0x{:x}", src.mem_addr)
+    } else if let Some(val) = src.expected_val {
+        format!("{}=0x{:x}", reg_name(src.reg), val)
     } else {
         reg_name(src.reg).to_string()
     }
