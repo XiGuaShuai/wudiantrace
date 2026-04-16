@@ -252,54 +252,67 @@ impl DepGraphBuilder {
     }
 }
 
-/// BFS backward on the dependency graph from `seeds`. Returns visited
-/// instruction indices in ascending order.
+/// Depth-limited BFS backward on the dependency graph from `seeds`.
+/// Returns `(visited_indices_sorted, truncated)`.
+///
+/// - `max_depth`: maximum number of dependency hops from any seed (e.g. 64)
+/// - `max_nodes`: hard cap on total visited instructions
 fn bfs_backward(
     deps: &[SmallVec<[u32; 4]>],
     seeds: &[u32],
+    max_depth: u32,
     max_nodes: usize,
     cancel: &Option<Arc<AtomicBool>>,
-) -> Vec<usize> {
+) -> (Vec<usize>, bool) {
     let n = deps.len();
     let mut visited = vec![false; n];
-    let mut queue = VecDeque::new();
+    // Queue entries: (instruction_index, depth)
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+    let mut count: usize = 0;
+    let mut truncated = false;
 
     for &seed in seeds {
         let s = seed as usize;
         if s < n && !visited[s] {
             visited[s] = true;
-            queue.push_back(seed);
+            queue.push_back((seed, 0));
+            count += 1;
         }
     }
 
-    while let Some(idx) = queue.pop_front() {
+    while let Some((idx, depth)) = queue.pop_front() {
         if let Some(c) = cancel {
             if c.load(Ordering::Relaxed) {
                 break;
             }
         }
+        if depth >= max_depth {
+            truncated = true;
+            continue;
+        }
         for &pred in &deps[idx as usize] {
             let p = pred as usize;
             if p < n && !visited[p] {
                 visited[p] = true;
-                queue.push_back(pred);
-                // Count check: seeds already counted
-                let count = queue.len();
+                count += 1;
                 if count >= max_nodes {
-                    break;
+                    // Drain the rest without expanding
+                    let mut result = Vec::with_capacity(count);
+                    for (i, &v) in visited.iter().enumerate() {
+                        if v { result.push(i); }
+                    }
+                    return (result, true);
                 }
+                queue.push_back((pred, depth + 1));
             }
         }
     }
 
-    // Collect in ascending order
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(count);
     for (i, &v) in visited.iter().enumerate() {
-        if v {
-            result.push(i);
-        }
+        if v { result.push(i); }
     }
-    result
+    (result, truncated)
 }
 
 #[inline]
@@ -626,16 +639,22 @@ impl TaintEngine {
                     seeds.push(start_index as u32);
                 }
 
-                // Phase 2: BFS backward on dependency graph
+                // Phase 2: depth-limited BFS backward on dependency graph
+                //
+                // max_depth: how many dependency hops from the target.
+                //   Typical chains are 5-30 deep; 64 covers most cases.
+                //   The user's scan_limit is reused as max_nodes (hard cap).
+                let max_depth = 64_u32;
                 let max_nodes = self.max_scan_distance as usize;
-                let visited = bfs_backward(&deps, &seeds, max_nodes, &self.cancel);
+                let (visited, truncated) =
+                    bfs_backward(&deps, &seeds, max_depth, max_nodes, &self.cancel);
 
                 if self.is_cancelled() {
                     self.stop_reason = StopReason::Cancelled;
                     return;
                 }
 
-                if visited.len() >= max_nodes {
+                if truncated {
                     self.stop_reason = StopReason::ScanLimitReached;
                 }
 
