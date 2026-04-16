@@ -1,8 +1,9 @@
 //! Taint propagation engine.
 //!
-//! Forward mode: linear taint-bitmap propagation (unchanged from original).
-//! Backward mode: forward-scan builds def-use dependency graph, then BFS
-//! traverses it from the target instruction to find all data sources.
+//! Forward mode: linear taint-bitmap propagation.
+//! Backward mode: forward-scan builds labeled def-use graph, then
+//! taint-guided traversal follows only the edges relevant to the
+//! currently active registers/memory.
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -14,38 +15,23 @@ use crate::parser::read_raw_line;
 use crate::reg::{normalize, reg_name, RegId, REG_INVALID, REG_NZCV, REG_XZR};
 use crate::trace::{InsnCategory, TraceLine};
 
-/// Sentinel: "this register/memory has no definition in the scanned range."
 const NO_DEF: u32 = u32::MAX;
-
-/// Default maximum dependency depth for backward BFS.
 const DEFAULT_MAX_DEPTH: u32 = 64;
 
 // ───────────────────────── public types ─────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TrackMode {
-    Forward,
-    Backward,
-}
+pub enum TrackMode { Forward, Backward }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum StopReason {
-    AllTaintCleared,
-    EndOfTrace,
-    ScanLimitReached,
-    Cancelled,
-}
+pub enum StopReason { AllTaintCleared, EndOfTrace, ScanLimitReached, Cancelled }
 
 #[derive(Copy, Clone, Debug)]
 pub struct TaintSource {
     pub reg: RegId,
     pub mem_addr: u64,
     pub is_mem: bool,
-    /// When true (backward mode), BFS seeds from `reg_last_def[reg]`
-    /// instead of from the full deps of the start instruction. Used for
-    /// tracking address-source registers of Load instructions.
     pub skip_start_propagation: bool,
-    /// Optional expected register value. Preserved for API compatibility.
     pub expected_val: Option<u64>,
 }
 
@@ -88,9 +74,26 @@ pub struct RemainingTaint {
     pub mems: Vec<u64>,
 }
 
-// ───────────────────── dep-graph (backward) ─────────────────────
+// ────────────────── labeled dep-graph (backward) ──────────────────
 
-/// Forward-scan state used to build the per-instruction dependency graph.
+/// Per-instruction dependency edges, labeled by which register/memory
+/// each edge serves. This allows taint-guided traversal to follow only
+/// the edges relevant to the currently tracked registers.
+struct InsnDeps {
+    /// (normalized_reg_id, predecessor_instruction_index)
+    /// Each entry means: "this instruction uses register R, which was
+    /// last defined by instruction P."
+    reg_preds: SmallVec<[(u8, u32); 4]>,
+    /// (memory_address, predecessor_store_index)
+    mem_preds: SmallVec<[(u64, u32); 2]>,
+}
+
+impl InsnDeps {
+    fn new() -> Self {
+        Self { reg_preds: SmallVec::new(), mem_preds: SmallVec::new() }
+    }
+}
+
 struct DepGraphBuilder {
     reg_last_def: [u32; 256],
     mem_last_def: FxHashMap<u64, u32>,
@@ -104,32 +107,26 @@ impl DepGraphBuilder {
         }
     }
 
-    #[inline]
-    fn reg_def(&self, reg: RegId) -> Option<u32> {
+    fn reg_def(&self, reg: RegId) -> Option<(u8, u32)> {
         if reg == REG_INVALID || reg == REG_XZR { return None; }
-        let idx = self.reg_last_def[normalize(reg) as usize];
-        if idx == NO_DEF { None } else { Some(idx) }
+        let nid = normalize(reg);
+        let idx = self.reg_last_def[nid as usize];
+        if idx == NO_DEF { None } else { Some((nid, idx)) }
     }
 
-    #[inline]
     fn set_reg_def(&mut self, reg: RegId, i: u32) {
         if reg == REG_INVALID || reg == REG_XZR { return; }
         self.reg_last_def[normalize(reg) as usize] = i;
     }
 
-    /// Build the dependency graph for `lines[0..=end]`.
-    ///
-    /// Returns `(deps, reg_last_def_snapshot)` where the snapshot captures
-    /// the register definition state *just before* instruction `end` updates
-    /// its own definitions (for `skip_start_propagation` lookups).
     fn build(
         &mut self,
         lines: &[TraceLine],
         end: usize,
         cancel: &Option<Arc<AtomicBool>>,
-    ) -> (Vec<SmallVec<[u32; 4]>>, [u32; 256]) {
+    ) -> (Vec<InsnDeps>, [u32; 256]) {
         let n = end + 1;
-        let mut deps: Vec<SmallVec<[u32; 4]>> = Vec::with_capacity(n);
+        let mut deps: Vec<InsnDeps> = Vec::with_capacity(n);
         let mut snapshot = [NO_DEF; 256];
 
         #[allow(clippy::needless_range_loop)]
@@ -137,70 +134,58 @@ impl DepGraphBuilder {
             if i & 0x1_FFFF == 0 {
                 if let Some(c) = cancel {
                     if c.load(Ordering::Relaxed) {
-                        deps.resize_with(n, SmallVec::new);
+                        deps.resize_with(n, InsnDeps::new);
                         return (deps, snapshot);
                     }
                 }
             }
 
             let line = &lines[i];
-            let mut preds = SmallVec::<[u32; 4]>::new();
+            let mut d = InsnDeps::new();
 
-            // ── collect source dependencies ──
-
-            let skip_src_deps = matches!(
+            let skip_src = matches!(
                 line.category,
                 InsnCategory::ImmLoad | InsnCategory::ExternalCall
             );
 
-            if !skip_src_deps {
-                // Register sources
+            if !skip_src {
                 for j in 0..line.num_src as usize {
-                    if let Some(def) = self.reg_def(line.src_regs[j]) {
-                        push_unique(&mut preds, def);
+                    if let Some((nid, pred)) = self.reg_def(line.src_regs[j]) {
+                        push_unique_reg(&mut d.reg_preds, nid, pred);
                     }
                 }
-
-                // CondSelect: implicit NZCV dependency (control flow).
-                // We still add it because csel's output depends on which
-                // branch was taken — but the taint-set reconstruction
-                // handles it separately (see below).
                 if line.category == InsnCategory::CondSelect {
-                    if let Some(def) = self.reg_def(REG_NZCV) {
-                        push_unique(&mut preds, def);
+                    if let Some((nid, pred)) = self.reg_def(REG_NZCV) {
+                        push_unique_reg(&mut d.reg_preds, nid, pred);
                     }
                 }
-
-                // PartialModify (movk): read-modify-write on dst.
                 if line.category == InsnCategory::PartialModify {
                     for j in 0..line.num_dst as usize {
-                        if let Some(def) = self.reg_def(line.dst_regs[j]) {
-                            push_unique(&mut preds, def);
+                        if let Some((nid, pred)) = self.reg_def(line.dst_regs[j]) {
+                            push_unique_reg(&mut d.reg_preds, nid, pred);
                         }
                     }
                 }
             }
 
-            // Memory read dependencies
             if line.has_mem_read {
-                if let Some(&def) = self.mem_last_def.get(&line.mem_read_addr) {
-                    push_unique(&mut preds, def);
+                if let Some(&pred) = self.mem_last_def.get(&line.mem_read_addr) {
+                    d.mem_preds.push((line.mem_read_addr, pred));
                 }
             }
             if line.has_mem_read2 {
-                if let Some(&def) = self.mem_last_def.get(&line.mem_read_addr2) {
-                    push_unique(&mut preds, def);
+                if let Some(&pred) = self.mem_last_def.get(&line.mem_read_addr2) {
+                    d.mem_preds.push((line.mem_read_addr2, pred));
                 }
             }
 
-            deps.push(preds);
+            deps.push(d);
 
-            // ── snapshot reg_last_def right before start updates ──
             if i == end {
                 snapshot = self.reg_last_def;
             }
 
-            // ── update definitions ──
+            // Update definitions
             match line.category {
                 InsnCategory::ExternalCall => {
                     for r in 0..=18u8 {
@@ -231,26 +216,65 @@ impl DepGraphBuilder {
     }
 }
 
-/// Depth-limited BFS backward on the dependency graph.
-fn bfs_backward(
-    deps: &[SmallVec<[u32; 4]>],
-    seeds: &[u32],
+#[inline]
+fn push_unique_reg(v: &mut SmallVec<[(u8, u32); 4]>, nid: u8, pred: u32) {
+    if !v.iter().any(|&(n, _)| n == nid) {
+        v.push((nid, pred));
+    }
+}
+
+/// Taint-guided backward traversal on the labeled dep graph.
+///
+/// Instead of blindly expanding all deps (which explodes through
+/// paired ldp/stp), this only follows dep edges whose output register
+/// or memory address is currently in the active (tracked) set.
+#[allow(clippy::too_many_arguments)]
+fn taint_guided_traverse(
+    lines: &[TraceLine],
+    deps: &[InsnDeps],
+    start_index: usize,
+    source: &TaintSource,
+    is_dst: bool,
     max_depth: u32,
     max_nodes: usize,
     cancel: &Option<Arc<AtomicBool>>,
-) -> (Vec<usize>, bool) {
-    let n = deps.len();
-    let mut visited = vec![false; n];
+) -> (Vec<ResultEntry>, bool, [bool; 256], FxHashMap<u64, ()>) {
+    let mut active_regs = [false; 256];
+    let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
+
+    // Seed the active set
+    if source.is_mem {
+        active_mem.insert(source.mem_addr, ());
+    } else {
+        active_regs[normalize(source.reg) as usize] = true;
+    }
+
+    // Queue: (instruction_index, depth)
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
-    let mut count: usize = 0;
+    let mut visited = vec![false; deps.len()];
+    let mut results: Vec<(usize, [bool; 256], Vec<u64>)> = Vec::new();
     let mut truncated = false;
 
-    for &seed in seeds {
-        let s = seed as usize;
-        if s < n && !visited[s] {
-            visited[s] = true;
-            queue.push_back((seed, 0));
-            count += 1;
+    // Seed the queue
+    if is_dst {
+        // Target is a dst: start from the instruction itself
+        queue.push_back((start_index as u32, 0));
+    } else {
+        // Target is a src: find its definition and start from there.
+        // Also include start_index in results (but don't expand its deps).
+        visited[start_index] = true;
+        results.push((
+            start_index,
+            active_regs,
+            active_mem.keys().copied().collect(),
+        ));
+        // Find the predecessor for the target register
+        let nid = normalize(source.reg);
+        for &(rn, pred) in &deps[start_index].reg_preds {
+            if rn == nid {
+                queue.push_back((pred, 1));
+                break;
+            }
         }
     }
 
@@ -258,72 +282,25 @@ fn bfs_backward(
         if let Some(c) = cancel {
             if c.load(Ordering::Relaxed) { break; }
         }
-        if depth >= max_depth {
+        let ui = idx as usize;
+        if ui >= deps.len() || visited[ui] { continue; }
+        if depth > max_depth {
             truncated = true;
             continue;
         }
-        for &pred in &deps[idx as usize] {
-            let p = pred as usize;
-            if p < n && !visited[p] {
-                visited[p] = true;
-                count += 1;
-                if count >= max_nodes {
-                    let mut result = Vec::with_capacity(count);
-                    for (i, &v) in visited.iter().enumerate() {
-                        if v { result.push(i); }
-                    }
-                    return (result, true);
-                }
-                queue.push_back((pred, depth + 1));
-            }
+        if results.len() >= max_nodes {
+            truncated = true;
+            break;
         }
-    }
 
-    let mut result = Vec::with_capacity(count);
-    for (i, &v) in visited.iter().enumerate() {
-        if v { result.push(i); }
-    }
-    (result, truncated)
-}
-
-#[inline]
-fn push_unique(v: &mut SmallVec<[u32; 4]>, val: u32) {
-    if !v.contains(&val) { v.push(val); }
-}
-
-/// Reconstruct cumulative taint sets by walking BFS results in reverse,
-/// simulating backward taint propagation on just the visited instructions.
-///
-/// For Store instructions, only the *value* source register is added to
-/// the active set (not the address base register). This is determined by
-/// checking which src_reg's value matches the stored memory value.
-/// Reconstruct results. Returns `(entries, remaining_regs, remaining_mems)`.
-fn reconstruct_taint_sets(
-    lines: &[TraceLine],
-    visited: &[usize],
-    source: &TaintSource,
-) -> (Vec<ResultEntry>, [bool; 256], FxHashMap<u64, ()>) {
-    let mut active_regs = [false; 256];
-    let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
-
-    // Seed
-    if source.is_mem {
-        active_mem.insert(source.mem_addr, ());
-    } else {
-        let nid = normalize(source.reg) as usize;
-        active_regs[nid] = true;
-    }
-
-    let mut entries: Vec<ResultEntry> = Vec::with_capacity(visited.len());
-
-    for &idx in visited.iter().rev() {
-        let line = &lines[idx];
+        let line = &lines[ui];
 
         // Check which outputs of this instruction are in the active set
         let mut dst_active = false;
         for j in 0..line.num_dst as usize {
-            let nid = normalize(line.dst_regs[j]) as usize;
-            if active_regs[nid] { dst_active = true; }
+            if active_regs[normalize(line.dst_regs[j]) as usize] {
+                dst_active = true;
+            }
         }
         let nzcv_active = line.sets_flags && active_regs[REG_NZCV as usize];
         let mem_w_active = line.has_mem_write
@@ -331,95 +308,114 @@ fn reconstruct_taint_sets(
         let mem_w2_active = line.has_mem_write2
             && active_mem.contains_key(&line.mem_write_addr2);
 
-        if dst_active || nzcv_active || mem_w_active || mem_w2_active {
-            // Remove outputs
-            if dst_active {
-                for j in 0..line.num_dst as usize {
-                    active_regs[normalize(line.dst_regs[j]) as usize] = false;
-                }
-            }
-            if nzcv_active {
-                active_regs[REG_NZCV as usize] = false;
-            }
-            if mem_w_active {
-                active_mem.remove(&line.mem_write_addr);
-            }
-            if mem_w2_active {
-                active_mem.remove(&line.mem_write_addr2);
-            }
+        if !dst_active && !nzcv_active && !mem_w_active && !mem_w2_active {
+            continue; // This instruction's outputs aren't tracked
+        }
 
-            // Add inputs (category-aware)
-            match line.category {
-                InsnCategory::ImmLoad | InsnCategory::ExternalCall => {
-                    // No data inputs to add
+        visited[ui] = true;
+
+        // Propagate: remove outputs, add inputs
+        if dst_active {
+            for j in 0..line.num_dst as usize {
+                active_regs[normalize(line.dst_regs[j]) as usize] = false;
+            }
+        }
+        if nzcv_active {
+            active_regs[REG_NZCV as usize] = false;
+        }
+        if mem_w_active {
+            active_mem.remove(&line.mem_write_addr);
+        }
+        if mem_w2_active {
+            active_mem.remove(&line.mem_write_addr2);
+        }
+
+        // Add inputs based on category
+        match line.category {
+            InsnCategory::ImmLoad | InsnCategory::ExternalCall => {
+                // No data inputs
+            }
+            InsnCategory::Load => {
+                // Memory source
+                if line.has_mem_read {
+                    active_mem.insert(line.mem_read_addr, ());
                 }
-                InsnCategory::Load => {
-                    // Data source: memory
-                    if line.has_mem_read {
-                        active_mem.insert(line.mem_read_addr, ());
-                    }
-                    if line.has_mem_read2 {
-                        active_mem.insert(line.mem_read_addr2, ());
-                    }
-                    // Address registers
-                    for j in 0..line.num_src as usize {
-                        active_regs[normalize(line.src_regs[j]) as usize] = true;
-                    }
+                if line.has_mem_read2 {
+                    active_mem.insert(line.mem_read_addr2, ());
                 }
-                InsnCategory::Store => {
-                    // Only taint the VALUE source register(s), not the
-                    // address base register.
-                    //
-                    // For single store (str x1, [x19]):
-                    //   src_regs[0] = x1 (value), rest are address regs
-                    // For pair store (stp x28, x27, [sp]):
-                    //   src_regs[0] = x28, src_regs[1] = x27, rest = addr
-                    if mem_w_active && line.num_src > 0 {
-                        active_regs[normalize(line.src_regs[0]) as usize] = true;
-                    }
-                    if mem_w2_active && line.num_src > 1 {
-                        active_regs[normalize(line.src_regs[1]) as usize] = true;
-                    }
+                // Address registers
+                for j in 0..line.num_src as usize {
+                    active_regs[normalize(line.src_regs[j]) as usize] = true;
                 }
-                InsnCategory::Compare => {
-                    // Compare → NZCV: taint the compared registers
-                    for j in 0..line.num_src as usize {
-                        active_regs[normalize(line.src_regs[j]) as usize] = true;
-                    }
+            }
+            InsnCategory::Store => {
+                // Only value source register(s), not address
+                if mem_w_active && line.num_src > 0 {
+                    active_regs[normalize(line.src_regs[0]) as usize] = true;
                 }
-                InsnCategory::CondSelect => {
-                    // CondSelect: taint src regs (the two candidate values)
-                    // but NOT NZCV (control dependency, not data).
-                    for j in 0..line.num_src as usize {
-                        active_regs[normalize(line.src_regs[j]) as usize] = true;
-                    }
-                    // Note: we intentionally do NOT add NZCV here.
-                    // The BFS already included the Compare instruction
-                    // via the NZCV dep edge in the graph. But for the
-                    // taint-set display, showing NZCV is noise.
+                if mem_w2_active && line.num_src > 1 {
+                    active_regs[normalize(line.src_regs[1]) as usize] = true;
                 }
-                _ => {
-                    // Generic: add src regs
-                    for j in 0..line.num_src as usize {
-                        active_regs[normalize(line.src_regs[j]) as usize] = true;
-                    }
-                    if line.has_mem_read {
-                        active_mem.insert(line.mem_read_addr, ());
-                    }
+            }
+            InsnCategory::CondSelect => {
+                // Data sources only, not NZCV
+                for j in 0..line.num_src as usize {
+                    active_regs[normalize(line.src_regs[j]) as usize] = true;
+                }
+            }
+            _ => {
+                for j in 0..line.num_src as usize {
+                    active_regs[normalize(line.src_regs[j]) as usize] = true;
+                }
+                if line.has_mem_read {
+                    active_mem.insert(line.mem_read_addr, ());
                 }
             }
         }
 
-        entries.push(ResultEntry {
-            index: idx,
-            reg_snapshot: active_regs,
-            mem_snapshot: active_mem.keys().copied().collect(),
-        });
+        // Snapshot
+        results.push((
+            ui,
+            active_regs,
+            active_mem.keys().copied().collect(),
+        ));
+
+        // Queue ONLY the predecessors for registers/memory now in active.
+        // This is the key difference from blind BFS.
+        let d = &deps[ui];
+        for &(nid, pred) in &d.reg_preds {
+            if active_regs[nid as usize] && !visited[pred as usize] {
+                queue.push_back((pred, depth + 1));
+            }
+        }
+        for &(addr, pred) in &d.mem_preds {
+            if active_mem.contains_key(&addr) && !visited[pred as usize] {
+                queue.push_back((pred, depth + 1));
+            }
+        }
+        // Also queue NZCV deps if NZCV is active
+        if active_regs[REG_NZCV as usize] {
+            for &(nid, pred) in &d.reg_preds {
+                if nid == REG_NZCV && !visited[pred as usize] {
+                    queue.push_back((pred, depth + 1));
+                }
+            }
+        }
     }
 
-    entries.reverse();
-    // Return remaining active state = unresolved sources (from before trace)
-    (entries, active_regs, active_mem)
+    // Sort by instruction index (ascending)
+    results.sort_by_key(|r| r.0);
+
+    let entries = results
+        .into_iter()
+        .map(|(idx, regs, mems)| ResultEntry {
+            index: idx,
+            reg_snapshot: regs,
+            mem_snapshot: mems,
+        })
+        .collect();
+
+    (entries, truncated, active_regs, active_mem)
 }
 
 // ───────────────────────── engine ─────────────────────────
@@ -431,7 +427,6 @@ pub struct TaintEngine {
     max_depth: u32,
     cancel: Option<Arc<AtomicBool>>,
 
-    // Forward-mode state
     reg_taint: [bool; 256],
     tainted_reg_count: i32,
     tainted_mem: FxHashMap<u64, Option<u64>>,
@@ -503,20 +498,14 @@ impl TaintEngine {
     fn taint_reg(&mut self, id: RegId) {
         if id == REG_INVALID || id == REG_XZR { return; }
         let nid = normalize(id) as usize;
-        if !self.reg_taint[nid] {
-            self.reg_taint[nid] = true;
-            self.tainted_reg_count += 1;
-        }
+        if !self.reg_taint[nid] { self.reg_taint[nid] = true; self.tainted_reg_count += 1; }
     }
 
     #[inline]
     fn untaint_reg(&mut self, id: RegId) {
         if id == REG_INVALID || id == REG_XZR { return; }
         let nid = normalize(id) as usize;
-        if self.reg_taint[nid] {
-            self.reg_taint[nid] = false;
-            self.tainted_reg_count -= 1;
-        }
+        if self.reg_taint[nid] { self.reg_taint[nid] = false; self.tainted_reg_count -= 1; }
     }
 
     #[inline]
@@ -535,9 +524,7 @@ impl TaintEngine {
     }
 
     fn any_caller_saved_tainted(&self) -> bool {
-        for reg_id in 0..=18u8 {
-            if self.is_reg_tainted(reg_id) { return true; }
-        }
+        for reg_id in 0..=18u8 { if self.is_reg_tainted(reg_id) { return true; } }
         self.is_reg_tainted(REG_NZCV)
     }
 
@@ -548,8 +535,7 @@ impl TaintEngine {
 
     fn record(&mut self, index: usize) {
         self.results.push(ResultEntry {
-            index,
-            reg_snapshot: self.reg_taint,
+            index, reg_snapshot: self.reg_taint,
             mem_snapshot: self.tainted_mem.keys().copied().collect(),
         });
     }
@@ -579,60 +565,51 @@ impl TaintEngine {
                     else { self.untaint_reg(line.dst_regs[i]); }
                 }
                 if line.sets_flags {
-                    if src_t { self.taint_reg(REG_NZCV); }
-                    else { self.untaint_reg(REG_NZCV); }
+                    if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
                 }
             }
             Load => {
                 if line.has_mem_read2 && line.num_dst >= 2 {
-                    let mem_t1 = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
-                    let mem_t2 = self.tainted_mem.contains_key(&line.mem_read_addr2);
-                    if mem_t1 {
-                        self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
-                        self.taint_reg(line.dst_regs[0]);
-                    } else { self.untaint_reg(line.dst_regs[0]); }
-                    if mem_t2 {
-                        self.check_mem_read_mismatch(line.mem_read_addr2, line.mem_read_val2, index);
-                        self.taint_reg(line.dst_regs[1]);
-                    } else { self.untaint_reg(line.dst_regs[1]); }
+                    let mt1 = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
+                    let mt2 = self.tainted_mem.contains_key(&line.mem_read_addr2);
+                    if mt1 { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); self.taint_reg(line.dst_regs[0]); }
+                    else { self.untaint_reg(line.dst_regs[0]); }
+                    if mt2 { self.check_mem_read_mismatch(line.mem_read_addr2, line.mem_read_val2, index); self.taint_reg(line.dst_regs[1]); }
+                    else { self.untaint_reg(line.dst_regs[1]); }
                 } else {
-                    let mem_t = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
-                    if mem_t { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); }
+                    let mt = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
+                    if mt { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); }
                     for i in 0..line.num_dst as usize {
-                        if mem_t { self.taint_reg(line.dst_regs[i]); }
-                        else { self.untaint_reg(line.dst_regs[i]); }
+                        if mt { self.taint_reg(line.dst_regs[i]); } else { self.untaint_reg(line.dst_regs[i]); }
                     }
                 }
             }
             Store => {
                 if line.has_mem_write {
                     if line.has_mem_write2 && line.num_src >= 2 {
-                        if self.is_reg_tainted(line.src_regs[0]) {
-                            self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val));
-                        } else { self.tainted_mem.remove(&line.mem_write_addr); }
-                        if self.is_reg_tainted(line.src_regs[1]) {
-                            self.tainted_mem.insert(line.mem_write_addr2, Some(line.mem_write_val2));
-                        } else { self.tainted_mem.remove(&line.mem_write_addr2); }
+                        if self.is_reg_tainted(line.src_regs[0]) { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
+                        else { self.tainted_mem.remove(&line.mem_write_addr); }
+                        if self.is_reg_tainted(line.src_regs[1]) { self.tainted_mem.insert(line.mem_write_addr2, Some(line.mem_write_val2)); }
+                        else { self.tainted_mem.remove(&line.mem_write_addr2); }
                     } else {
-                        let src_t = line.num_src > 0 && self.is_reg_tainted(line.src_regs[0]);
-                        if src_t { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
+                        let st = line.num_src > 0 && self.is_reg_tainted(line.src_regs[0]);
+                        if st { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
                         else { self.tainted_mem.remove(&line.mem_write_addr); }
                     }
                 }
             }
             Compare => {
-                let src_t = self.any_src_tainted(line);
-                if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
+                let st = self.any_src_tainted(line);
+                if st { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
             }
             Branch => {}
             Other => {
-                let src_t = self.any_src_tainted(line);
+                let st = self.any_src_tainted(line);
                 for i in 0..line.num_dst as usize {
-                    if src_t { self.taint_reg(line.dst_regs[i]); }
-                    else { self.untaint_reg(line.dst_regs[i]); }
+                    if st { self.taint_reg(line.dst_regs[i]); } else { self.untaint_reg(line.dst_regs[i]); }
                 }
                 if line.has_mem_write {
-                    if src_t { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
+                    if st { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
                     else { self.tainted_mem.remove(&line.mem_write_addr); }
                 }
             }
@@ -660,9 +637,7 @@ impl TaintEngine {
         self.stop_reason = StopReason::EndOfTrace;
         self.start_index = None;
         self.remaining_taint_at_boundary = None;
-        if lines.is_empty() || start_index >= lines.len() {
-            return;
-        }
+        if lines.is_empty() || start_index >= lines.len() { return; }
         self.start_index = Some(start_index);
 
         match self.mode {
@@ -671,87 +646,60 @@ impl TaintEngine {
                 let mut idle: u32 = 0;
                 let mut i = start_index + 1;
                 while i < lines.len() {
-                    if self.is_cancelled() {
-                        self.stop_reason = StopReason::Cancelled;
-                        return;
-                    }
+                    if self.is_cancelled() { self.stop_reason = StopReason::Cancelled; return; }
                     let line = &lines[i];
                     let mut involved = self.any_src_tainted(line);
-                    if !involved && line.category == InsnCategory::ExternalCall && self.any_caller_saved_tainted() {
-                        involved = true;
-                    }
-                    if !involved && line.has_mem_write && self.tainted_mem.contains_key(&line.mem_write_addr) {
-                        involved = true;
-                    }
-                    if !involved && line.has_mem_write2 && self.tainted_mem.contains_key(&line.mem_write_addr2) {
-                        involved = true;
-                    }
+                    if !involved && line.category == InsnCategory::ExternalCall && self.any_caller_saved_tainted() { involved = true; }
+                    if !involved && line.has_mem_write && self.tainted_mem.contains_key(&line.mem_write_addr) { involved = true; }
+                    if !involved && line.has_mem_write2 && self.tainted_mem.contains_key(&line.mem_write_addr2) { involved = true; }
                     self.propagate_forward(line, i);
-                    if involved {
-                        self.record(i);
-                        idle = 0;
-                    } else {
+                    if involved { self.record(i); idle = 0; }
+                    else {
                         idle += 1;
-                        if idle >= self.max_scan_distance {
-                            self.stop_reason = StopReason::ScanLimitReached;
-                            break;
-                        }
+                        if idle >= self.max_scan_distance { self.stop_reason = StopReason::ScanLimitReached; break; }
                     }
                     if self.tainted_reg_count == 0 && self.tainted_mem.is_empty() {
-                        self.stop_reason = StopReason::AllTaintCleared;
-                        break;
+                        self.stop_reason = StopReason::AllTaintCleared; break;
                     }
                     i += 1;
                 }
             }
 
             TrackMode::Backward => {
-                // Phase 1: forward scan to build dependency graph
+                // Phase 1: build labeled dep graph
                 let mut builder = DepGraphBuilder::new();
-                let (deps, reg_snapshot) =
+                let (deps, _reg_snapshot) =
                     builder.build(lines, start_index, &self.cancel);
 
-                if self.is_cancelled() {
-                    self.stop_reason = StopReason::Cancelled;
-                    return;
-                }
+                if self.is_cancelled() { self.stop_reason = StopReason::Cancelled; return; }
 
-                // Determine BFS seeds
-                let seeds = self.compute_bfs_seeds(
-                    &lines[start_index], start_index, &reg_snapshot,
-                    &builder.mem_last_def,
-                );
+                // Determine if target is a dst of the start instruction
+                let start_line = &lines[start_index];
+                let is_dst = if self.source.skip_start_propagation || self.source.is_mem {
+                    false
+                } else {
+                    let tnid = normalize(self.source.reg) as usize;
+                    (0..start_line.num_dst as usize)
+                        .any(|j| normalize(start_line.dst_regs[j]) as usize == tnid)
+                };
 
-                // Phase 2: depth-limited BFS
+                // Phase 2: taint-guided traversal
                 let max_nodes = self.max_scan_distance as usize;
-                let (mut visited, truncated) =
-                    bfs_backward(&deps, &seeds, self.max_depth, max_nodes, &self.cancel);
+                let (entries, truncated, remaining_regs, remaining_mem) =
+                    taint_guided_traverse(
+                        lines, &deps, start_index, &self.source,
+                        is_dst, self.max_depth, max_nodes, &self.cancel,
+                    );
 
-                if self.is_cancelled() {
-                    self.stop_reason = StopReason::Cancelled;
-                    return;
-                }
+                if self.is_cancelled() { self.stop_reason = StopReason::Cancelled; return; }
 
                 if truncated {
                     self.stop_reason = StopReason::ScanLimitReached;
                 }
 
-                // Ensure start_index is in results even if it wasn't a
-                // BFS seed (happens when target is a src register of the
-                // start instruction, e.g. tracking x8 from `str x8, [x19]`).
-                if !visited.contains(&start_index) {
-                    let pos = visited.partition_point(|&x| x < start_index);
-                    visited.insert(pos, start_index);
-                }
-
-                // Phase 3: reconstruct taint sets.
-                // Remaining active_regs/active_mem after reconstruction
-                // = unresolved sources from before the trace.
-                let (entries, remaining_regs, remaining_mem) =
-                    reconstruct_taint_sets(lines, &visited, &self.source);
                 self.results = entries;
 
-                // Build boundary taint from remaining active set
+                // Build boundary taint
                 let mut regs = Vec::new();
                 for i in 0..256u16 {
                     if remaining_regs[i as usize] {
@@ -768,91 +716,25 @@ impl TaintEngine {
         }
     }
 
-    /// Compute BFS seed indices based on the TaintSource type.
-    ///
-    /// Key logic: if the target register is a DST of the start instruction,
-    /// seed from start_index (expanding all its deps). Otherwise the target
-    /// is a SRC (e.g. tracking x8 from `str x8, [x19]`) — seed only from
-    /// `reg_last_def[target_reg]` to avoid expanding unrelated deps like
-    /// the Store's address registers.
-    fn compute_bfs_seeds(
-        &self,
-        start_line: &TraceLine,
-        start_index: usize,
-        reg_snapshot: &[u32; 256],
-        mem_last_def: &FxHashMap<u64, u32>,
-    ) -> SmallVec<[u32; 4]> {
-        let mut seeds = SmallVec::<[u32; 4]>::new();
-
-        if self.source.skip_start_propagation {
-            // Explicitly tracking a source register (e.g. address offset)
-            let nid = normalize(self.source.reg) as usize;
-            let def = reg_snapshot[nid];
-            if def != NO_DEF {
-                seeds.push(def);
-            }
-        } else if self.source.is_mem {
-            if let Some(&def) = mem_last_def.get(&self.source.mem_addr) {
-                seeds.push(def);
-            }
-        } else {
-            // Check: is the target register a DST of the start instruction?
-            let target_nid = normalize(self.source.reg) as usize;
-            let mut is_dst = false;
-            for j in 0..start_line.num_dst as usize {
-                if normalize(start_line.dst_regs[j]) as usize == target_nid {
-                    is_dst = true;
-                    break;
-                }
-            }
-
-            if is_dst {
-                // Target is a destination: expand from the instruction
-                seeds.push(start_index as u32);
-            } else {
-                // Target is a source (e.g. x8 in `str x8, [x19]`):
-                // seed from its definition only, skip address deps.
-                let def = reg_snapshot[target_nid];
-                if def != NO_DEF {
-                    seeds.push(def);
-                }
-            }
-        }
-
-        seeds
-    }
-
-
     // ───────── format_result ─────────
 
     pub fn format_result(&self, lines: &[TraceLine], bytes: &[u8]) -> String {
         let mut out = String::new();
-        let mode_s = match self.mode {
-            TrackMode::Forward => "Forward",
-            TrackMode::Backward => "Backward",
-        };
+        let mode_s = match self.mode { TrackMode::Forward => "Forward", TrackMode::Backward => "Backward" };
         out.push_str(&format!("=== Taint {} Tracking ===\n", mode_s));
         out.push_str("Source: ");
-        if self.source.is_mem {
-            out.push_str(&format!("mem:0x{:x}", self.source.mem_addr));
-        } else {
-            out.push_str(reg_name(self.source.reg));
-        }
+        if self.source.is_mem { out.push_str(&format!("mem:0x{:x}", self.source.mem_addr)); }
+        else { out.push_str(reg_name(self.source.reg)); }
         out.push('\n');
         if let Some(idx) = self.start_index {
             if let Some(tl) = lines.get(idx) {
-                out.push_str(&format!(
-                    "Started from: line {} (file offset 0x{:x})\n",
-                    tl.line_number, tl.file_offset
-                ));
+                out.push_str(&format!("Started from: line {} (file offset 0x{:x})\n", tl.line_number, tl.file_offset));
             }
         }
         out.push_str(&format!("Total matched: {} instructions\n", self.results.len()));
         let stop = match self.stop_reason {
             StopReason::AllTaintCleared => "all taint cleared".to_string(),
-            StopReason::ScanLimitReached => format!(
-                "scan limit reached (depth {} / {} nodes)", self.max_depth, self.max_scan_distance
-            ),
+            StopReason::ScanLimitReached => format!("scan limit reached (depth {} / {} nodes)", self.max_depth, self.max_scan_distance),
             StopReason::EndOfTrace => "end of trace".to_string(),
             StopReason::Cancelled => "cancelled".to_string(),
         };
@@ -861,9 +743,7 @@ impl TaintEngine {
         if let Some(ref remaining) = self.remaining_taint_at_boundary {
             out.push_str("⚠ 以下 taint 在到达 trace 边界时仍未清除:\n");
             out.push_str(&format!("  寄存器: {}\n",
-                if remaining.regs.is_empty() { "(无)".to_string() }
-                else { remaining.regs.join(", ") }
-            ));
+                if remaining.regs.is_empty() { "(无)".to_string() } else { remaining.regs.join(", ") }));
             if !remaining.mems.is_empty() {
                 let mems: Vec<String> = remaining.mems.iter().map(|a| format!("0x{:x}", a)).collect();
                 out.push_str(&format!("  内存: {}\n", mems.join(", ")));
@@ -873,34 +753,22 @@ impl TaintEngine {
                 let first_line = first_line.trim();
                 let func_id = first_line.split_whitespace().next().unwrap_or("?");
                 let lr = first_line.find("LR=")
-                    .map(|pos| {
-                        let rest = &first_line[pos + 3..];
-                        rest.split([',', ' ', ')']).next().unwrap_or("?")
-                    })
+                    .map(|pos| { let rest = &first_line[pos + 3..]; rest.split([',', ' ', ')']).next().unwrap_or("?") })
                     .unwrap_or("?");
-                out.push_str(&format!(
-                    "  → 这些值是函数 {} 的入参/初始状态,由调用方(LR={})传入\n",
-                    func_id, lr
-                ));
+                out.push_str(&format!("  → 这些值是函数 {} 的入参/初始状态,由调用方(LR={})传入\n", func_id, lr));
             }
         }
 
         if !self.mismatches.is_empty() {
-            out.push_str(&format!(
-                "⚠ 发现 {} 处内存值不匹配(中间可能有 trace 未覆盖的写入):\n",
-                self.mismatches.len()
-            ));
+            out.push_str(&format!("⚠ 发现 {} 处内存值不匹配:\n", self.mismatches.len()));
             for mm in &self.mismatches {
                 let tl = &lines[mm.index];
-                out.push_str(&format!(
-                    "  line {} mem:0x{:x}: 期望 0x{:x}, 实际 0x{:x}\n",
-                    tl.line_number, mm.mem_addr, mm.expected_val, mm.actual_val
-                ));
+                out.push_str(&format!("  line {} mem:0x{:x}: 期望 0x{:x}, 实际 0x{:x}\n",
+                    tl.line_number, mm.mem_addr, mm.expected_val, mm.actual_val));
             }
         }
 
         out.push_str("============================================================\n\n");
-
         for entry in &self.results {
             let tl = &lines[entry.index];
             let raw = read_raw_line(bytes, tl);
