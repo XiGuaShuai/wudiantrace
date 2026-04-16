@@ -308,11 +308,11 @@ fn taint_guided_collect(
         match line.category {
             InsnCategory::ImmLoad | InsnCategory::ExternalCall => {}
             InsnCategory::Load => {
+                // Only follow the data chain through memory.
+                // Address registers are NOT added to active — they are
+                // a separate concern ("向后追踪地址来源" menu).
                 if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
                 if line.has_mem_read2 { active_mem.insert(line.mem_read_addr2, ()); }
-                for j in 0..line.num_src as usize {
-                    active_regs[normalize(line.src_regs[j]) as usize] = true;
-                }
             }
             InsnCategory::Store => {
                 if mem_w_active && line.num_src > 0 { active_regs[normalize(line.src_regs[0]) as usize] = true; }

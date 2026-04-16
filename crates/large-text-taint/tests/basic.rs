@@ -176,14 +176,16 @@ fn format_result_includes_header_and_lines() {
     assert!(s.contains("tainted: {"));
 }
 
-/// Backward tracking a Load's destination register now tracks BOTH:
-/// 1. The memory chain (where the loaded value came from)
-/// 2. The address-source registers (with value-sensitive expected values)
+/// Backward tracking a Load's destination register follows ONLY the
+/// data chain through memory (like GumTrace's original design).
+/// Address registers are NOT tracked — that's a separate operation
+/// via "向后追踪地址来源".
 ///
-/// So even when no Store to the memory address exists in the trace,
-/// the address chain still produces useful results.
+/// When no Store to the memory address exists in the trace, only
+/// the ldr itself is in the result (the memory source is reported
+/// as a boundary taint).
 #[test]
-fn backward_load_tracks_value_and_address() {
+fn backward_load_tracks_data_only() {
     let input = b"\
 libtiny.so!71c0a0 0x76ff3430a0: \"\tcsel\tx8, x11, x10, lo\" X11=0x6b0, X10=0x3210, FLAGS=0x80000000 => X8=0x6b0
 libtiny.so!71c0a4 0x76ff3430a4: \"\tldr\tx8, [x27, x8]\" X8=0x6b0, X27=0x76ff3bb960 => X8=0x76a00ec25c
@@ -199,14 +201,12 @@ MEM R 0x76ff3bc010 [8 bytes]: 5c c2 0e a0 76 00 00 00  v
     engine.set_mode(TrackMode::Backward);
     engine.set_source(TaintSource::from_reg(x8));
     engine.set_max_scan_distance(1000);
-    // Use run_with_bytes so address-source regs get value-sensitive tracking
     engine.run_with_bytes(lines, 1, input);
 
-    // No Store to 0x76ff3bc010, but csel writes x8 (address offset) →
-    // should be hit via address-source tracking.
-    assert!(engine.results().len() >= 2, "should hit ldr + csel");
-    assert_eq!(engine.results()[0].index, 0, "csel");
-    assert_eq!(engine.results()[1].index, 1, "ldr");
+    // No Store to 0x76ff3bc010 → only the ldr itself is hit.
+    // csel is NOT included because address registers are not tracked.
+    assert_eq!(engine.results().len(), 1, "data-only: only ldr hit");
+    assert_eq!(engine.results()[0].index, 1);
 }
 
 /// Backward tracking an *address-source register* of a Load using
