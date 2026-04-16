@@ -1696,6 +1696,7 @@ impl TextViewerApp {
 
                                     if let Some(tl) = &parsed {
                                         let targets = crate::taint::collect_targets(tl);
+                                        let addr_targets = crate::taint::collect_addr_source_targets(tl);
                                         if targets.is_empty() {
                                             ui.label(
                                                 egui::RichText::new(
@@ -1719,6 +1720,27 @@ impl TextViewerApp {
                                                     }
                                                 }
                                             });
+                                            // For Load/Store: offer a separate
+                                            // sub-menu that tracks address-source
+                                            // registers directly (skipping the
+                                            // Load/Store propagation on the start
+                                            // line).
+                                            if !addr_targets.is_empty() {
+                                                ui.menu_button("向后追踪地址来源...", |ui| {
+                                                    for src in &addr_targets {
+                                                        if ui
+                                                            .button(crate::taint::source_display(src))
+                                                            .clicked()
+                                                        {
+                                                            chosen = Some((
+                                                                large_text_taint::engine::TrackMode::Backward,
+                                                                *src,
+                                                            ));
+                                                            ui.close_menu();
+                                                        }
+                                                    }
+                                                });
+                                            }
                                             ui.menu_button("向前追踪起点...", |ui| {
                                                 for src in &targets {
                                                     if ui

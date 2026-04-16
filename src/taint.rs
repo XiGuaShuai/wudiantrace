@@ -650,6 +650,35 @@ pub fn collect_targets(tl: &TraceLine) -> Vec<TaintSource> {
     out
 }
 
+/// For Load/Store instructions, collect address-source registers that the
+/// user might want to track independently. Returns sources with
+/// `skip_start_propagation = true` so the engine tracks the register
+/// directly without redirecting taint through the Load/Store propagation.
+///
+/// Example: `ldr x8, [x27, x8]` → returns [x27, x8] as address sources.
+/// The user can pick x8 here to track *where the address offset came from*,
+/// separate from tracking *what value was loaded*.
+pub fn collect_addr_source_targets(tl: &TraceLine) -> Vec<TaintSource> {
+    use large_text_taint::trace::InsnCategory;
+    if !matches!(tl.category, InsnCategory::Load | InsnCategory::Store) {
+        return Vec::new();
+    }
+    let mut out: Vec<TaintSource> = Vec::new();
+    let mut seen_reg: [bool; 256] = [false; 256];
+    for i in 0..tl.num_src as usize {
+        let id = tl.src_regs[i];
+        if id == REG_INVALID {
+            continue;
+        }
+        let n = large_text_taint::reg::normalize(id) as usize;
+        if !seen_reg[n] {
+            seen_reg[n] = true;
+            out.push(TaintSource::from_reg_as_source(id));
+        }
+    }
+    out
+}
+
 pub fn source_display(src: &TaintSource) -> String {
     format_source_label(src)
 }

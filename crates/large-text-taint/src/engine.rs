@@ -27,6 +27,11 @@ pub struct TaintSource {
     pub reg: RegId,
     pub mem_addr: u64,
     pub is_mem: bool,
+    /// When true, the engine skips `propagate_backward` on the starting line
+    /// and just records it. Use this when the user wants to track a *source*
+    /// register of the starting instruction (e.g. the address-offset register
+    /// of a Load) rather than a *destination* register.
+    pub skip_start_propagation: bool,
 }
 
 impl TaintSource {
@@ -35,6 +40,7 @@ impl TaintSource {
             reg,
             mem_addr: 0,
             is_mem: false,
+            skip_start_propagation: false,
         }
     }
     pub fn from_mem(addr: u64) -> Self {
@@ -42,6 +48,19 @@ impl TaintSource {
             reg: REG_INVALID,
             mem_addr: addr,
             is_mem: true,
+            skip_start_propagation: false,
+        }
+    }
+    /// Create a source that tracks a register but skips backward propagation
+    /// on the starting line. Used for tracking address-source registers of
+    /// Load instructions (e.g. the x8 in `ldr x8, [x27, x8]` as the address
+    /// offset, not as the loaded value).
+    pub fn from_reg_as_source(reg: RegId) -> Self {
+        Self {
+            reg,
+            mem_addr: 0,
+            is_mem: false,
+            skip_start_propagation: true,
         }
     }
 }
@@ -429,14 +448,6 @@ impl TaintEngine {
                         self.untaint_reg(line.dst_regs[1]);
                         self.tainted_mem.insert(line.mem_read_addr2, Some(line.mem_read_val2));
                     }
-                    // Taint address-forming source registers so the
-                    // backward chain tracks what determined the load
-                    // address (e.g. base + index in `ldp x0, x1, [x2, x3]`).
-                    if t0 || t1 {
-                        for i in 0..line.num_src as usize {
-                            self.taint_reg(line.src_regs[i]);
-                        }
-                    }
                 } else {
                     let mut dst_t = false;
                     for i in 0..line.num_dst as usize {
@@ -445,16 +456,8 @@ impl TaintEngine {
                             self.untaint_reg(line.dst_regs[i]);
                         }
                     }
-                    if dst_t {
-                        if line.has_mem_read {
-                            self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
-                        }
-                        // Taint address-forming source registers so the
-                        // backward chain also tracks what determined the
-                        // load address (e.g. base + offset in `ldr x8, [x27, x8]`).
-                        for i in 0..line.num_src as usize {
-                            self.taint_reg(line.src_regs[i]);
-                        }
+                    if dst_t && line.has_mem_read {
+                        self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
                     }
                 }
             }
@@ -590,8 +593,16 @@ impl TaintEngine {
                 }
             }
             TrackMode::Backward => {
-                self.propagate_backward(&lines[start_index], start_index);
-                self.record(start_index);
+                if self.source.skip_start_propagation {
+                    // The user is tracking a source register (e.g. address
+                    // offset of a Load). Just record the starting line and
+                    // keep the register tainted — don't run propagate_backward
+                    // which would untaint it and redirect taint to memory.
+                    self.record(start_index);
+                } else {
+                    self.propagate_backward(&lines[start_index], start_index);
+                    self.record(start_index);
+                }
                 let mut idle: u32 = 0;
                 let mut i = start_index as isize - 1;
                 while i >= 0 {
