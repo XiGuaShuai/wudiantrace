@@ -658,31 +658,112 @@ impl TaintEngine {
                     self.stop_reason = StopReason::ScanLimitReached;
                 }
 
-                // Build results: for each visited instruction, record which
-                // dst registers it defines (shown as "tainted" in the UI).
-                for &idx in &visited {
+                // Reconstruct cumulative taint sets by walking the BFS
+                // results in reverse (from target backward), simulating
+                // backward taint propagation on just the visited instructions.
+                let mut active_regs = [false; 256];
+                let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
+
+                // Seed: the target register or memory
+                if self.source.is_mem {
+                    active_mem.insert(self.source.mem_addr, ());
+                } else {
+                    let nid = normalize(self.source.reg) as usize;
+                    active_regs[nid] = true;
+                }
+
+                // Process visited instructions in DESCENDING order
+                let mut entries: Vec<ResultEntry> = Vec::with_capacity(visited.len());
+                for &idx in visited.iter().rev() {
                     let line = &lines[idx];
-                    let mut snap = [false; 256];
+
+                    // Check which outputs are in the active set
+                    let mut dst_active = false;
                     for j in 0..line.num_dst as usize {
                         let nid = normalize(line.dst_regs[j]) as usize;
-                        snap[nid] = true;
-                    }
-                    if line.sets_flags {
-                        snap[REG_NZCV as usize] = true;
-                    }
-                    if line.has_mem_write {
-                        // Mark store's source registers for display
-                        for j in 0..line.num_src as usize {
-                            let nid = normalize(line.src_regs[j]) as usize;
-                            snap[nid] = true;
+                        if active_regs[nid] {
+                            dst_active = true;
                         }
                     }
-                    self.results.push(ResultEntry {
+                    let nzcv_active = line.sets_flags
+                        && active_regs[REG_NZCV as usize];
+                    let mem_w_active = line.has_mem_write
+                        && active_mem.contains_key(&line.mem_write_addr);
+                    let mem_w2_active = line.has_mem_write2
+                        && active_mem.contains_key(&line.mem_write_addr2);
+
+                    // If this instruction's outputs are active, propagate
+                    // backward: remove outputs, add inputs.
+                    if dst_active || nzcv_active || mem_w_active || mem_w2_active {
+                        // Remove outputs from active set
+                        if dst_active {
+                            for j in 0..line.num_dst as usize {
+                                let nid = normalize(line.dst_regs[j]) as usize;
+                                active_regs[nid] = false;
+                            }
+                        }
+                        if nzcv_active {
+                            active_regs[REG_NZCV as usize] = false;
+                        }
+                        if mem_w_active {
+                            active_mem.remove(&line.mem_write_addr);
+                        }
+                        if mem_w2_active {
+                            active_mem.remove(&line.mem_write_addr2);
+                        }
+
+                        // Add inputs to active set (category-aware)
+                        match line.category {
+                            InsnCategory::ImmLoad => {
+                                // Immediate: no inputs to add
+                            }
+                            InsnCategory::ExternalCall => {
+                                // External call: outputs come from outside
+                            }
+                            InsnCategory::Load => {
+                                // Load: add memory read + address regs
+                                if line.has_mem_read {
+                                    active_mem.insert(line.mem_read_addr, ());
+                                }
+                                if line.has_mem_read2 {
+                                    active_mem.insert(line.mem_read_addr2, ());
+                                }
+                                for j in 0..line.num_src as usize {
+                                    let nid = normalize(line.src_regs[j]) as usize;
+                                    active_regs[nid] = true;
+                                }
+                            }
+                            InsnCategory::Store => {
+                                // Store: source register → memory
+                                for j in 0..line.num_src as usize {
+                                    let nid = normalize(line.src_regs[j]) as usize;
+                                    active_regs[nid] = true;
+                                }
+                            }
+                            _ => {
+                                // Generic: add src regs
+                                for j in 0..line.num_src as usize {
+                                    let nid = normalize(line.src_regs[j]) as usize;
+                                    active_regs[nid] = true;
+                                }
+                                if line.has_mem_read {
+                                    active_mem.insert(line.mem_read_addr, ());
+                                }
+                            }
+                        }
+                    }
+
+                    // Snapshot the current active set
+                    entries.push(ResultEntry {
                         index: idx,
-                        reg_snapshot: snap,
-                        mem_snapshot: Vec::new(),
+                        reg_snapshot: active_regs,
+                        mem_snapshot: active_mem.keys().copied().collect(),
                     });
                 }
+
+                // Reverse to ascending order
+                entries.reverse();
+                self.results = entries;
 
                 // Detect remaining taint at boundary: if BFS reached
                 // instructions whose sources are undefined (NO_DEF),
