@@ -4,6 +4,9 @@
 //! retains `file_offset` / `line_len` so the viewer can map results back to
 //! their original lines without re-parsing.
 
+use memchr::memchr;
+use memchr::memmem;
+
 use crate::reg::{parse_reg_name, REG_INVALID};
 use crate::trace::{classify_mnemonic, InsnCategory, TraceLine};
 
@@ -31,16 +34,7 @@ fn is_instruction_line(buf: &[u8]) -> bool {
         return false;
     }
     let cap = buf.len().min(64);
-    let needle = b".so!";
-    if cap < needle.len() {
-        return false;
-    }
-    for i in 0..=cap - needle.len() {
-        if &buf[i..i + needle.len()] == needle {
-            return true;
-        }
-    }
-    false
+    memmem::find(&buf[..cap], b".so!").is_some()
 }
 
 /// `-> libc.so!malloc(1440) ret: 0x78d7d22d20` 或 `-> libc.so!free`
@@ -70,9 +64,8 @@ fn hex_val(c: u8) -> Option<u8> {
 
 /// Parse the raw byte dump after `]: ` into a little-endian u64 (up to 8 bytes).
 fn parse_mem_value(buf: &[u8]) -> u64 {
-    let marker = b"]: ";
-    let pos = match buf.windows(marker.len()).position(|w| w == marker) {
-        Some(p) => p + marker.len(),
+    let pos = match memmem::find(buf, b"]: ") {
+        Some(p) => p + 3,
         None => return 0,
     };
     let mut val: u64 = 0;
@@ -202,10 +195,7 @@ impl TraceParser {
                 break;
             }
             let line_start = cur_offset;
-            // find newline
-            let nl = bytes[i..]
-                .iter()
-                .position(|&b| b == b'\n')
+            let nl = memchr(b'\n', &bytes[i..])
                 .map(|p| i + p)
                 .unwrap_or(bytes.len());
             let mut end = nl;
@@ -308,15 +298,11 @@ impl TraceParser {
 
     /// Parse one xgtrace instruction line. Returns true on success.
     fn parse_line(buf: &[u8], line_number: u32, offset: u64, out: &mut TraceLine) -> bool {
-        if !is_instruction_line(buf) {
-            return false;
-        }
         out.line_number = line_number;
         out.file_offset = offset;
         out.line_len = buf.len() as u32;
 
-        // 1) find '!'
-        let bang = match buf.iter().position(|&b| b == b'!') {
+        let bang = match memchr(b'!', buf) {
             Some(p) => p,
             None => return false,
         };

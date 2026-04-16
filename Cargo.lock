@@ -1808,7 +1808,9 @@ name = "large-text-taint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "memchr",
  "memmap2",
+ "rustc-hash 2.1.1",
 ]
 
 [[package]]

@@ -44,17 +44,6 @@ pub struct TaintCompleted {
     pub source_label: String,
     pub instructions_parsed: usize,
     pub formatted: String, // ready to be saved with "Save results"
-    /// 反向追踪到边界时仍未清零的 taint 信息 + 函数入口描述。
-    /// `None` = AllTaintCleared(正常结束)或正向追踪。
-    pub boundary_info: Option<BoundaryInfo>,
-}
-
-/// 反向追踪到 trace 边界时的"来源在 trace 之前"提示。
-pub struct BoundaryInfo {
-    pub remaining_regs: Vec<String>,
-    pub remaining_mems: Vec<u64>,
-    pub function_id: String,  // e.g. "libtiny.so!178dc8"
-    pub caller_lr: String,    // e.g. "0x2a"
 }
 
 pub enum TaintMessage {
@@ -456,39 +445,6 @@ fn run_job(job: JobConfig) {
         .map(|r| build_hit(r, lines, bytes))
         .collect::<Vec<_>>();
 
-    // 提取 boundary info:当反向追踪到 trace 边界、taint 未清时
-    let boundary_info = engine.remaining_taint().map(|rt| {
-        // 从 trace 窗口第一条指令的 raw line 提取函数名和 LR
-        let (func_id, caller_lr) = if !lines.is_empty() {
-            let first_raw = read_raw_line(bytes, &lines[0]);
-            let first_raw = first_raw.trim().to_string();
-            let fid = first_raw
-                .split_whitespace()
-                .next()
-                .unwrap_or("?")
-                .to_string();
-            let lr = first_raw
-                .find("LR=")
-                .map(|pos| {
-                    let rest = &first_raw[pos + 3..];
-                    rest.split([',', ' '])
-                        .next()
-                        .unwrap_or("?")
-                        .to_string()
-                })
-                .unwrap_or_else(|| "?".to_string());
-            (fid, lr)
-        } else {
-            ("?".to_string(), "?".to_string())
-        };
-        BoundaryInfo {
-            remaining_regs: rt.regs.clone(),
-            remaining_mems: rt.mems.clone(),
-            function_id: func_id,
-            caller_lr,
-        }
-    });
-
     let completed = TaintCompleted {
         hits,
         stop_reason,
@@ -496,7 +452,6 @@ fn run_job(job: JobConfig) {
         source_label,
         instructions_parsed: parser.len(),
         formatted,
-        boundary_info,
     };
     let _ = tx.send(TaintMessage::Done(Box::new(completed)));
 }
@@ -512,7 +467,7 @@ fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit
             regs.push(reg_name(i as u8).to_string());
         }
     }
-    let mut mems: Vec<u64> = entry.mem_snapshot.iter().copied().collect();
+    let mut mems = entry.mem_snapshot.clone();
     mems.sort_unstable();
 
     // ExternalCall(-> libc.so!malloc(48) ret: ...)的显示策略:
@@ -991,52 +946,6 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
             return;
         };
         render_panel_header_summary(ui, completed);
-
-        // 如果反向追踪到 trace 边界仍有未清 taint,显示"来源在
-        // trace 之前"的提示,附上函数入口和调用方 LR。
-        if let Some(ref bi) = completed.boundary_info {
-            ui.add_space(4.0);
-            egui::Frame::NONE
-                .fill(egui::Color32::from_rgb(50, 50, 70))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 170, 255)))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("⚠ 部分 taint 来源在 trace 覆盖范围之前")
-                            .size(12.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(180, 190, 255)),
-                    );
-                    if !bi.remaining_regs.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "未清寄存器: {}",
-                                bi.remaining_regs.join(", ")
-                            ))
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 200, 200)),
-                        );
-                    }
-                    if !bi.remaining_mems.is_empty() {
-                        let mems: Vec<String> =
-                            bi.remaining_mems.iter().map(|a| format!("0x{:x}", a)).collect();
-                        ui.label(
-                            egui::RichText::new(format!("未清内存: {}", mems.join(", ")))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(200, 200, 200)),
-                        );
-                    }
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "→ 函数 {} 的入参/初始状态,由调用方 (LR={}) 传入",
-                            bi.function_id, bi.caller_lr
-                        ))
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(255, 210, 130)),
-                    );
-                });
-        }
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {

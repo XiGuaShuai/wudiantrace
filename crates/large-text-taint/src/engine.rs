@@ -1,6 +1,6 @@
 //! Taint propagation engine — direct port of TaintEngine.{h,cpp}.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ impl TaintSource {
 pub struct ResultEntry {
     pub index: usize,
     pub reg_snapshot: [bool; 256],
-    pub mem_snapshot: HashSet<u64>,
+    pub mem_snapshot: Vec<u64>,
 }
 
 /// 内存值不匹配：Store 写入的值和 Load 读出的值不一致，
@@ -71,7 +71,7 @@ pub struct TaintEngine {
 
     reg_taint: [bool; 256],
     tainted_reg_count: i32,
-    tainted_mem: HashMap<u64, Option<u64>>,
+    tainted_mem: FxHashMap<u64, Option<u64>>,
     results: Vec<ResultEntry>,
     mismatches: Vec<ValueMismatch>,
     stop_reason: StopReason,
@@ -112,7 +112,7 @@ impl TaintEngine {
             cancel: None,
             reg_taint: [false; 256],
             tainted_reg_count: 0,
-            tainted_mem: HashMap::new(),
+            tainted_mem: FxHashMap::default(),
             results: Vec::new(),
             mismatches: Vec::new(),
             stop_reason: StopReason::EndOfTrace,
@@ -236,7 +236,7 @@ impl TaintEngine {
         self.results.push(ResultEntry {
             index,
             reg_snapshot: self.reg_taint,
-            mem_snapshot: self.tainted_mem.keys().copied().collect(),
+            mem_snapshot: self.tainted_mem.keys().copied().collect::<Vec<_>>(),
         });
     }
 
@@ -260,19 +260,6 @@ impl TaintEngine {
     }
 
     fn check_mem_read_mismatch(&mut self, addr: u64, actual_val: u64, index: usize) {
-        if let Some(&Some(expected)) = self.tainted_mem.get(&addr) {
-            if expected != actual_val {
-                self.mismatches.push(ValueMismatch {
-                    index,
-                    mem_addr: addr,
-                    expected_val: expected,
-                    actual_val,
-                });
-            }
-        }
-    }
-
-    fn check_mem_write_mismatch(&mut self, addr: u64, actual_val: u64, index: usize) {
         if let Some(&Some(expected)) = self.tainted_mem.get(&addr) {
             if expected != actual_val {
                 self.mismatches.push(ValueMismatch {
@@ -458,19 +445,43 @@ impl TaintEngine {
             Store => {
                 if line.has_mem_write {
                     if line.has_mem_write2 && line.num_src >= 2 {
-                        if self.tainted_mem.contains_key(&line.mem_write_addr) {
-                            self.check_mem_write_mismatch(line.mem_write_addr, line.mem_write_val, index);
-                            self.tainted_mem.remove(&line.mem_write_addr);
+                        if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr) {
+                            if let Some(expected) = entry {
+                                if expected != line.mem_write_val {
+                                    self.mismatches.push(ValueMismatch {
+                                        index,
+                                        mem_addr: line.mem_write_addr,
+                                        expected_val: expected,
+                                        actual_val: line.mem_write_val,
+                                    });
+                                }
+                            }
                             self.taint_reg(line.src_regs[0]);
                         }
-                        if self.tainted_mem.contains_key(&line.mem_write_addr2) {
-                            self.check_mem_write_mismatch(line.mem_write_addr2, line.mem_write_val2, index);
-                            self.tainted_mem.remove(&line.mem_write_addr2);
+                        if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr2) {
+                            if let Some(expected) = entry {
+                                if expected != line.mem_write_val2 {
+                                    self.mismatches.push(ValueMismatch {
+                                        index,
+                                        mem_addr: line.mem_write_addr2,
+                                        expected_val: expected,
+                                        actual_val: line.mem_write_val2,
+                                    });
+                                }
+                            }
                             self.taint_reg(line.src_regs[1]);
                         }
-                    } else if self.tainted_mem.contains_key(&line.mem_write_addr) {
-                        self.check_mem_write_mismatch(line.mem_write_addr, line.mem_write_val, index);
-                        self.tainted_mem.remove(&line.mem_write_addr);
+                    } else if let Some(entry) = self.tainted_mem.remove(&line.mem_write_addr) {
+                        if let Some(expected) = entry {
+                            if expected != line.mem_write_val {
+                                self.mismatches.push(ValueMismatch {
+                                    index,
+                                    mem_addr: line.mem_write_addr,
+                                    expected_val: expected,
+                                    actual_val: line.mem_write_val,
+                                });
+                            }
+                        }
                         if line.num_src > 0 {
                             self.taint_reg(line.src_regs[0]);
                         }
@@ -524,7 +535,7 @@ impl TaintEngine {
                         self.stop_reason = StopReason::Cancelled;
                         return;
                     }
-                    let line = &lines[i].clone();
+                    let line = &lines[i];
                     let mut involved = self.any_src_tainted(line);
                     if !involved
                         && line.category == InsnCategory::ExternalCall
@@ -563,8 +574,7 @@ impl TaintEngine {
                 }
             }
             TrackMode::Backward => {
-                let start_line = lines[start_index].clone();
-                self.propagate_backward(&start_line, start_index);
+                self.propagate_backward(&lines[start_index], start_index);
                 self.record(start_index);
                 let mut idle: u32 = 0;
                 let mut i = start_index as isize - 1;
@@ -574,7 +584,7 @@ impl TaintEngine {
                         self.results.reverse();
                         return;
                     }
-                    let line = &lines[i as usize].clone();
+                    let line = &lines[i as usize];
                     let mut involved = self.any_dst_tainted(line);
                     if !involved
                         && line.category == InsnCategory::ExternalCall

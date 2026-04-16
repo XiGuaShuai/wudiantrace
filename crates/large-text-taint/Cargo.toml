@@ -7,6 +7,8 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+rustc-hash = "2"
+memchr = "2"
 
 [dev-dependencies]
 memmap2 = "0.9"
