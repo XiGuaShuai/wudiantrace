@@ -1719,9 +1719,9 @@ impl TextViewerApp {
                 // 量化抖动,不作反应;超过则必然是用户操作。
                 let expected_offset = self.scroll_line as f32 * line_height;
                 let actual_offset = output.state.offset.y;
-                if line_height > 0.0
-                    && (actual_offset - expected_offset).abs() > 2.0 * line_height
-                {
+                let scrollbar_dragged = line_height > 0.0
+                    && (actual_offset - expected_offset).abs() > 2.0 * line_height;
+                if scrollbar_dragged {
                     let total = self.line_indexer.total_lines() as i64;
                     let upper = (total - 1).max(0);
                     let dragged_line =
@@ -1731,10 +1731,12 @@ impl TextViewerApp {
                 }
 
                 // 保底:把渲染实际选用的顶行写回 `scroll_line`,让状态栏
-                // "Line: N" 这种 UI 反映真实显示内容(正常情况下这里
-                // `scroll_line` 已经一致,这一步只是幂等保险)。
-                if let Some(first_row) = first_visible_row {
-                    self.scroll_line = first_row;
+                // "Line: N" 这种 UI 反映真实显示内容。
+                // 滚动条拖拽时跳过——否则会覆盖刚检测到的拖拽目标行。
+                if !scrollbar_dragged {
+                    if let Some(first_row) = first_visible_row {
+                        self.scroll_line = first_row;
+                    }
                 }
             } else {
                 ui.centered_and_justified(|ui| {
