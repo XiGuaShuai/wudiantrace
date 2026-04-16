@@ -112,6 +112,9 @@ pub struct TextViewerApp {
     // Taint tracking
     pub(crate) taint: TaintState,
 
+    // Occurrence highlight (double-click a word → highlight all same words)
+    occurrence_word: Option<String>,
+
     // Search results list panel (010-Editor-style)
     show_search_list: bool,
     search_list_dock: crate::taint::DockSide,
@@ -190,6 +193,7 @@ impl Default for TextViewerApp {
             open_start_time: None,
             search_count_start_time: None,
             taint: TaintState::default(),
+            occurrence_word: None,
             show_search_list: true,
             search_list_dock: crate::taint::DockSide::Bottom,
             search_preview_cache: HashMap::new(),
@@ -1360,6 +1364,17 @@ impl TextViewerApp {
                         let count = row_range.end - row_range.start;
                         let render_range = corrected_start_line..(corrected_start_line + count);
 
+                        // Measure monospace character width once for
+                        // double-click word extraction.
+                        let mono_char_width = {
+                            let font_id = egui::FontId::monospace(self.font_size);
+                            ui.fonts(|f| {
+                                f.layout_no_wrap("A".to_string(), font_id, egui::Color32::WHITE)
+                                    .rect
+                                    .width()
+                            })
+                        };
+
                         for line_num in render_range {
                             // Read line starting at current_offset
                             // We need to find the end of the line
@@ -1421,7 +1436,8 @@ impl TextViewerApp {
                                 .trim_end_matches('\r');
 
                             // Collect matches that fall within this line's byte span; this works even with sparse line indexing
-                            let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
+                            // (start, end, is_selected, is_occurrence)
+                            let mut line_matches: Vec<(usize, usize, bool, bool)> = Vec::new();
 
                             // Determine the byte offset of the currently selected result
                             let selected_offset = if self.total_search_results > 0
@@ -1439,7 +1455,7 @@ impl TextViewerApp {
                                 for (m_start, m_end) in self.search_engine.find_in_text(line_text) {
                                     let abs_start = start + m_start;
                                     let is_selected = Some(abs_start) == selected_offset;
-                                    line_matches.push((m_start, m_end, is_selected));
+                                    line_matches.push((m_start, m_end, is_selected, false));
                                 }
                             } else {
                                 // Only highlight results present in search_results (e.g. single find)
@@ -1467,8 +1483,28 @@ impl TextViewerApp {
                                     let global_idx = self.search_page_start_index + idx;
                                     let is_selected = global_idx == self.current_result_index;
 
-                                    line_matches.push((rel_start, rel_end, is_selected));
+                                    line_matches.push((rel_start, rel_end, is_selected, false));
                                 }
+                            }
+
+                            // Occurrence highlight: find all occurrences of the
+                            // double-clicked word in this line.
+                            if let Some(ref occ_word) = self.occurrence_word {
+                                let mut search_from = 0;
+                                while search_from < line_text.len() {
+                                    if let Some(pos) = line_text[search_from..].find(occ_word.as_str()) {
+                                        let abs_start = search_from + pos;
+                                        let abs_end = abs_start + occ_word.len();
+                                        line_matches.push((abs_start, abs_end, false, true));
+                                        search_from = abs_end;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                // Sort by start position so the LayoutJob segments
+                                // are built in order; search matches and occurrence
+                                // matches may interleave.
+                                line_matches.sort_by_key(|m| m.0);
                             }
 
                             // Identify the line by its byte offset (exact),
@@ -1516,7 +1552,7 @@ impl TextViewerApp {
                                     let mut job = egui::text::LayoutJob::default();
                                     let mut last_end = 0;
 
-                                    for (abs_start, abs_end, is_selected) in line_matches.iter() {
+                                    for (abs_start, abs_end, is_selected, is_occurrence) in line_matches.iter() {
                                         if *abs_start > last_end {
                                             job.append(
                                                 &line_text[last_end..*abs_start],
@@ -1539,18 +1575,30 @@ impl TextViewerApp {
                                         }
 
                                         let match_end = (*abs_end).min(line_text.len());
+                                        let bg = if *is_occurrence {
+                                            // Occurrence highlight: subtle blue/cyan
+                                            if self.dark_mode {
+                                                egui::Color32::from_rgb(60, 100, 160)
+                                            } else {
+                                                egui::Color32::from_rgb(180, 215, 255)
+                                            }
+                                        } else if *is_selected {
+                                            egui::Color32::from_rgb(255, 200, 0)
+                                        } else {
+                                            egui::Color32::YELLOW
+                                        };
+                                        let fg = if *is_occurrence && self.dark_mode {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::BLACK
+                                        };
                                         job.append(
                                             &line_text[*abs_start..match_end],
                                             0.0,
                                             egui::TextFormat {
                                                 font_id: egui::FontId::monospace(self.font_size),
-                                                color: egui::Color32::BLACK,
-                                                background: if *is_selected {
-                                                    egui::Color32::from_rgb(255, 200, 0)
-                                                // orange-ish for current match
-                                                } else {
-                                                    egui::Color32::YELLOW
-                                                },
+                                                color: fg,
+                                                background: bg,
                                                 ..Default::default()
                                             },
                                         );
@@ -1608,6 +1656,24 @@ impl TextViewerApp {
                                 // Enable text selection for copy-paste
                                 if label.hovered() {
                                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+                                }
+
+                                // Occurrence highlight: double-click a word to
+                                // highlight all same words in the viewport.
+                                if label.double_clicked() {
+                                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                        let rel_x = pos.x - label.rect.left();
+                                        let char_idx = (rel_x / mono_char_width).floor() as usize;
+                                        let word = extract_word_at(line_text, char_idx);
+                                        if word.is_empty() {
+                                            self.occurrence_word = None;
+                                        } else {
+                                            self.occurrence_word = Some(word);
+                                        }
+                                    }
+                                } else if label.clicked() {
+                                    // Single click clears occurrence highlight.
+                                    self.occurrence_word = None;
                                 }
 
                                 // Right-click: taint tracking menu for this line.
@@ -2292,6 +2358,29 @@ impl eframe::App for TextViewerApp {
 
 /// One-line preview of a match (~32 bytes before, ~128 bytes after, trimmed
 /// to the current line, tabs/whitespace collapsed).
+/// Extract the word (alphanumeric + underscore) surrounding character index
+/// `char_idx` in `text`. Returns an empty string if the index falls on a
+/// non-word character or is out of bounds.
+fn extract_word_at(text: &str, char_idx: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if char_idx >= chars.len() || !is_word_char(chars[char_idx]) {
+        return String::new();
+    }
+    let mut start = char_idx;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = char_idx;
+    while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
+        end += 1;
+    }
+    chars[start..=end].iter().collect()
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 fn preview_for_match(reader: &FileReader, m: &SearchResult) -> String {
     const BEFORE: usize = 32;
     const AFTER: usize = 128;
