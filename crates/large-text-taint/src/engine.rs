@@ -297,11 +297,12 @@ fn push_unique(v: &mut SmallVec<[u32; 4]>, val: u32) {
 /// For Store instructions, only the *value* source register is added to
 /// the active set (not the address base register). This is determined by
 /// checking which src_reg's value matches the stored memory value.
+/// Reconstruct results. Returns `(entries, remaining_regs, remaining_mems)`.
 fn reconstruct_taint_sets(
     lines: &[TraceLine],
     visited: &[usize],
     source: &TaintSource,
-) -> Vec<ResultEntry> {
+) -> (Vec<ResultEntry>, [bool; 256], FxHashMap<u64, ()>) {
     let mut active_regs = [false; 256];
     let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
 
@@ -417,7 +418,8 @@ fn reconstruct_taint_sets(
     }
 
     entries.reverse();
-    entries
+    // Return remaining active state = unresolved sources (from before trace)
+    (entries, active_regs, active_mem)
 }
 
 // ───────────────────────── engine ─────────────────────────
@@ -742,11 +744,26 @@ impl TaintEngine {
                     visited.insert(pos, start_index);
                 }
 
-                // Phase 3: reconstruct taint sets
-                self.results = reconstruct_taint_sets(lines, &visited, &self.source);
+                // Phase 3: reconstruct taint sets.
+                // Remaining active_regs/active_mem after reconstruction
+                // = unresolved sources from before the trace.
+                let (entries, remaining_regs, remaining_mem) =
+                    reconstruct_taint_sets(lines, &visited, &self.source);
+                self.results = entries;
 
-                // Detect remaining taint at boundary
-                self.detect_boundary_taint(lines, &visited, &deps);
+                // Build boundary taint from remaining active set
+                let mut regs = Vec::new();
+                for i in 0..256u16 {
+                    if remaining_regs[i as usize] {
+                        regs.push(reg_name(i as u8).to_string());
+                    }
+                }
+                let mut mems: Vec<u64> = remaining_mem.keys().copied().collect();
+                mems.sort_unstable();
+                if !regs.is_empty() || !mems.is_empty() {
+                    self.remaining_taint_at_boundary =
+                        Some(RemainingTaint { regs, mems });
+                }
             }
         }
     }
@@ -805,47 +822,6 @@ impl TaintEngine {
         seeds
     }
 
-    /// Detect registers/memory whose sources are outside the trace range.
-    fn detect_boundary_taint(
-        &mut self,
-        lines: &[TraceLine],
-        visited: &[usize],
-        deps: &[SmallVec<[u32; 4]>],
-    ) {
-        let mut boundary_regs = Vec::new();
-        let mut boundary_mems: Vec<u64> = Vec::new();
-
-        for &idx in visited {
-            let line = &lines[idx];
-            // If this instruction has NO predecessors in the dep graph,
-            // its sources come from before the trace.
-            if deps[idx].is_empty() && idx < deps.len() {
-                // Collect src regs that had NO_DEF
-                for j in 0..line.num_src as usize {
-                    let reg = line.src_regs[j];
-                    if reg != REG_INVALID && reg != REG_XZR {
-                        let name = reg_name(reg).to_string();
-                        if !boundary_regs.contains(&name) {
-                            boundary_regs.push(name);
-                        }
-                    }
-                }
-                // Memory reads with no matching store
-                if line.has_mem_read && !deps[idx].is_empty() {
-                    // (already handled above)
-                } else if line.has_mem_read {
-                    boundary_mems.push(line.mem_read_addr);
-                }
-            }
-        }
-
-        if !boundary_regs.is_empty() || !boundary_mems.is_empty() {
-            self.remaining_taint_at_boundary = Some(RemainingTaint {
-                regs: boundary_regs,
-                mems: boundary_mems,
-            });
-        }
-    }
 
     // ───────── format_result ─────────
 
