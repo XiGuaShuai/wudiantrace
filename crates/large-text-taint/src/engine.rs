@@ -429,6 +429,14 @@ impl TaintEngine {
                         self.untaint_reg(line.dst_regs[1]);
                         self.tainted_mem.insert(line.mem_read_addr2, Some(line.mem_read_val2));
                     }
+                    // Taint address-forming source registers so the
+                    // backward chain tracks what determined the load
+                    // address (e.g. base + index in `ldp x0, x1, [x2, x3]`).
+                    if t0 || t1 {
+                        for i in 0..line.num_src as usize {
+                            self.taint_reg(line.src_regs[i]);
+                        }
+                    }
                 } else {
                     let mut dst_t = false;
                     for i in 0..line.num_dst as usize {
@@ -437,8 +445,16 @@ impl TaintEngine {
                             self.untaint_reg(line.dst_regs[i]);
                         }
                     }
-                    if dst_t && line.has_mem_read {
-                        self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
+                    if dst_t {
+                        if line.has_mem_read {
+                            self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
+                        }
+                        // Taint address-forming source registers so the
+                        // backward chain also tracks what determined the
+                        // load address (e.g. base + offset in `ldr x8, [x27, x8]`).
+                        for i in 0..line.num_src as usize {
+                            self.taint_reg(line.src_regs[i]);
+                        }
                     }
                 }
             }

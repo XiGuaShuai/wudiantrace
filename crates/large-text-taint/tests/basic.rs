@@ -175,3 +175,53 @@ fn format_result_includes_header_and_lines() {
     assert!(s.contains("Source: x19"));
     assert!(s.contains("tainted: {"));
 }
+
+/// Backward tracking through a Load instruction should taint the
+/// address-forming source registers so that the chain continues
+/// to earlier instructions that wrote the address components.
+///
+/// Scenario (execution order):
+///   line 0: csel  x8, x11, x10, lo  → x8 = 0x6b0 (address offset)
+///   line 1: ldr   x8, [x27, x8]     → x8 = mem[x27+x8]
+///
+/// Backward from line 1 tracking x8:
+///   - ldr writes x8 from memory → untaint x8, taint mem + src regs (x27, x8)
+///   - csel writes x8 → since x8 is now tainted (as address source), this
+///     line should be recorded and propagate to x11, x10.
+#[test]
+fn backward_load_taints_address_regs() {
+    let input = b"\
+libtiny.so!71c0a0 0x76ff3430a0: \"\tcsel\tx8, x11, x10, lo\" X11=0x6b0, X10=0x3210, FLAGS=0x80000000 => X8=0x6b0
+libtiny.so!71c0a4 0x76ff3430a4: \"\tldr\tx8, [x27, x8]\" X8=0x6b0, X27=0x76ff3bb960 => X8=0x76a00ec25c
+MEM R 0x76ff3bc010 [8 bytes]: 5c c2 0e a0 76 00 00 00  v
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(input);
+    let lines = p.lines();
+    assert_eq!(lines.len(), 2, "should parse 2 instruction lines");
+
+    let x8 = parse_reg_name(b"x8");
+
+    let mut engine = TaintEngine::new();
+    engine.set_mode(TrackMode::Backward);
+    engine.set_source(TaintSource::from_reg(x8));
+    engine.set_max_scan_distance(1000);
+    engine.run(lines, 1); // start from ldr (index 1)
+
+    let results = engine.results();
+    eprintln!("results count: {}", results.len());
+    for r in results {
+        eprintln!("  hit index={} (line {})", r.index, lines[r.index].line_number);
+    }
+
+    // Must have at least 2 hits: the ldr itself + the csel that wrote the
+    // address offset.
+    assert!(
+        results.len() >= 2,
+        "backward tracking through ldr should also hit csel; got {} hits",
+        results.len()
+    );
+    // First result (after reverse) should be the csel (earlier instruction).
+    assert_eq!(results[0].index, 0, "first hit should be the csel (index 0)");
+    assert_eq!(results[1].index, 1, "second hit should be the ldr (index 1)");
+}
