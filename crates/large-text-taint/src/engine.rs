@@ -247,6 +247,29 @@ impl TaintEngine {
     /// If no expected value is set for any tainted dst register, returns `true`
     /// (no filtering). Only checks registers that have both taint AND an
     /// expected value.
+    /// Taint all source registers of an instruction and set their expected
+    /// values by parsing the INPUT section of the raw trace line. Used by
+    /// Load backward to also track address-forming registers.
+    fn taint_src_regs_with_values(&mut self, line: &TraceLine, bytes: &[u8]) {
+        for i in 0..line.num_src as usize {
+            let id = line.src_regs[i];
+            self.taint_reg(id);
+            // Parse input value from raw bytes for value-sensitive tracking
+            if !bytes.is_empty() {
+                let off = line.file_offset as usize;
+                let len = line.line_len as usize;
+                if off.saturating_add(len) <= bytes.len() {
+                    let raw = &bytes[off..off + len];
+                    if let Some(val) = crate::parser::parse_input_reg_val(raw, id) {
+                        let nid = normalize(id) as usize;
+                        self.reg_expected_val[nid] = val;
+                        self.reg_has_expected_val[nid] = true;
+                    }
+                }
+            }
+        }
+    }
+
     fn check_dst_values(&self, line: &TraceLine, bytes: &[u8]) -> bool {
         for d in 0..line.num_dst as usize {
             let nid = normalize(line.dst_regs[d]) as usize;
@@ -476,7 +499,7 @@ impl TaintEngine {
         }
     }
 
-    fn propagate_backward(&mut self, line: &TraceLine, index: usize) {
+    fn propagate_backward(&mut self, line: &TraceLine, index: usize, bytes: &[u8]) {
         use InsnCategory::*;
         match line.category {
             ExternalCall => {
@@ -539,13 +562,22 @@ impl TaintEngine {
                     let t1 = self.is_reg_tainted(line.dst_regs[1]);
                     if t0 {
                         self.untaint_reg(line.dst_regs[0]);
+                        let nid = normalize(line.dst_regs[0]) as usize;
+                        self.reg_has_expected_val[nid] = false;
                         if line.has_mem_read {
                             self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
                         }
                     }
                     if t1 {
                         self.untaint_reg(line.dst_regs[1]);
+                        let nid = normalize(line.dst_regs[1]) as usize;
+                        self.reg_has_expected_val[nid] = false;
                         self.tainted_mem.insert(line.mem_read_addr2, Some(line.mem_read_val2));
+                    }
+                    // Also taint address-source registers with value-sensitive
+                    // expected values, so the address chain is also tracked.
+                    if t0 || t1 {
+                        self.taint_src_regs_with_values(line, bytes);
                     }
                 } else {
                     let mut dst_t = false;
@@ -553,10 +585,17 @@ impl TaintEngine {
                         if self.is_reg_tainted(line.dst_regs[i]) {
                             dst_t = true;
                             self.untaint_reg(line.dst_regs[i]);
+                            let nid = normalize(line.dst_regs[i]) as usize;
+                            self.reg_has_expected_val[nid] = false;
                         }
                     }
-                    if dst_t && line.has_mem_read {
-                        self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
+                    if dst_t {
+                        if line.has_mem_read {
+                            self.tainted_mem.insert(line.mem_read_addr, Some(line.mem_read_val));
+                        }
+                        // Also taint address-source registers with
+                        // value-sensitive expected values.
+                        self.taint_src_regs_with_values(line, bytes);
                     }
                 }
             }
@@ -725,7 +764,7 @@ impl TaintEngine {
                     // which would untaint it and redirect taint to memory.
                     self.record(start_index);
                 } else {
-                    self.propagate_backward(&lines[start_index], start_index);
+                    self.propagate_backward(&lines[start_index], start_index, bytes);
                     self.record(start_index);
                 }
                 let mut idle: u32 = 0;
@@ -768,7 +807,7 @@ impl TaintEngine {
                         involved = self.check_dst_values(line, bytes);
                     }
                     if involved {
-                        self.propagate_backward(line, i as usize);
+                        self.propagate_backward(line, i as usize, bytes);
                         self.record(i as usize);
                         idle = 0;
                     } else {
