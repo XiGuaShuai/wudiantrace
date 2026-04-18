@@ -65,13 +65,6 @@ pub struct TraceLine {
     /// of the same register plus an immediate offset, so taint-wise it
     /// should be treated as identity — not as a data load from memory.
     pub has_writeback_base: bool,
-
-    /// For Load/Store lines: the base register of the memory operand
-    /// (`[base, ...]` → `base`). `REG_INVALID` on non-memory instructions.
-    /// Used by the engine to recognise SP/FP-relative spills so backward
-    /// address-source tracing can stop at spill boundaries instead of
-    /// chasing unrelated values through the stack slot.
-    pub mem_base_reg: RegId,
 }
 
 impl Default for TraceLine {
@@ -101,7 +94,6 @@ impl Default for TraceLine {
             line_len: 0,
             pair_reg_size: 0,
             has_writeback_base: false,
-            mem_base_reg: REG_INVALID,
         }
     }
 }

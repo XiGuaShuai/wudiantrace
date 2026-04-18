@@ -1,7 +1,6 @@
 use large_text_taint::engine::{StopReason, TaintEngine, TaintSource, TrackMode};
 use large_text_taint::parser::TraceParser;
 use large_text_taint::reg::parse_reg_name;
-use large_text_taint::tag::TaintOrigin;
 use large_text_taint::trace::InsnCategory;
 
 const FIXTURE: &str = "\
@@ -547,93 +546,6 @@ fn mem_operand_with_space_no_duplicate_src() {
     assert_eq!(tl.num_src, 2, "src regs should be [x27, x8] (no duplicate)");
     assert_eq!(tl.src_regs[0], parse_reg_name(b"x27"));
     assert_eq!(tl.src_regs[1], parse_reg_name(b"x8"));
-    assert_eq!(
-        tl.mem_base_reg,
-        parse_reg_name(b"x27"),
-        "mem base is the first register inside the brackets"
-    );
-}
-
-/// Regression: SP-relative memory operands must set mem_base_reg to sp
-/// so the engine can recognise stack-spill slots.
-#[test]
-fn sp_relative_store_sets_mem_base_to_sp() {
-    let mut p = TraceParser::new();
-    p.load_from_bytes(
-        b"libtiny.so!100 0x76fed9f100: \"\tstr\tx2, [sp, #0x60]\" X2=0x123, SP=0x1000\n\
-MEM W 0x1060 [8 bytes]: 23 01 00 00 00 00 00 00  ........\n",
-    );
-    let tl = &p.lines()[0];
-    assert_eq!(tl.mem_base_reg, large_text_taint::reg::REG_SP);
-}
-
-/// Regression (bug reported at line 7658469 of the xhs xgtrace): address-
-/// source backward tracing used to chase writers of SP-relative slots,
-/// turning the result into a 64-depth spill-reload loop of unrelated
-/// registers. With `stop_at_sp_spill` on, the trace stops at the spill
-/// boundary and records the slot as a boundary mem-taint.
-#[test]
-fn stop_at_sp_spill_prevents_stack_chasing() {
-    // Scenario:
-    //   str x9, [sp, #0x60]          (line 0 — sets up spill slot)
-    //   ... unrelated code ...
-    //   ldr x11, [sp, #0x60]         (line 2 — reload into x11)
-    //   ldr x8,  [x27, x11]          (line 3 — uses x11 as address index)
-    // Address-source backward tracing from `x11` on line 3 should:
-    //   - stop_at_sp_spill ON  → NOT visit line 0 (str x9, [sp, #0x60])
-    //   - stop_at_sp_spill OFF → DO  visit line 0 (old behaviour)
-    let src = "\
-libtiny.so!100 0x76fed9f100: \"\tstr\tx9, [sp, #0x60]\" X9=0x99, SP=0x1000\n\
-MEM W 0x1060 [8 bytes]: 99 00 00 00 00 00 00 00  ........\n\
-libtiny.so!104 0x76fed9f104: \"\tmov\tx0, x0\" X0=0x0 => X0=0x0\n\
-libtiny.so!108 0x76fed9f108: \"\tldr\tx11, [sp, #0x60]\" SP=0x1000 => X11=0x99\n\
-MEM R 0x1060 [8 bytes]: 99 00 00 00 00 00 00 00  ........\n\
-libtiny.so!10c 0x76fed9f10c: \"\tldr\tx8, [x27, x11]\" X27=0x2000, X11=0x99 => X8=0x1\n\
-MEM R 0x2099 [8 bytes]: 01 00 00 00 00 00 00 00  ........\n";
-    let mut p = TraceParser::new();
-    p.load_from_bytes(src.as_bytes());
-    let ldr_x8_idx = p
-        .lines()
-        .iter()
-        .rposition(|l| l.category == InsnCategory::Load)
-        .unwrap();
-    let str_spill_idx = p
-        .lines()
-        .iter()
-        .position(|l| l.category == InsnCategory::Store)
-        .unwrap();
-    let x11 = parse_reg_name(b"x11");
-
-    // OFF: the old behaviour — str x9 (the spill writer) shows up.
-    {
-        let mut e = TaintEngine::new();
-        e.set_mode(TrackMode::Backward);
-        e.set_source(TaintSource::from_reg_as_source(x11));
-        e.run(p.lines(), ldr_x8_idx);
-        assert!(
-            e.results().iter().any(|r| r.index == str_spill_idx),
-            "without stop_at_sp_spill the str x9 spill writer must be reached"
-        );
-    }
-
-    // ON: the new behaviour — do NOT cross into the spill writer.
-    {
-        let mut e = TaintEngine::new();
-        e.set_mode(TrackMode::Backward);
-        e.set_source(TaintSource::from_reg_as_source(x11));
-        e.set_stop_at_sp_spill(true);
-        e.run(p.lines(), ldr_x8_idx);
-        assert!(
-            !e.results().iter().any(|r| r.index == str_spill_idx),
-            "stop_at_sp_spill must not chase into the sp-relative spill writer"
-        );
-        // The spill slot surfaces as a boundary taint instead.
-        let rem = e.remaining_taint().expect("should report boundary taint");
-        assert!(
-            rem.mems.contains(&0x1060),
-            "spill slot address must appear in boundary mems"
-        );
-    }
 }
 
 /// Regression: the start-line entry's snapshot in backward mode must
@@ -676,140 +588,6 @@ MEM R 0x2000 [8 bytes]: 05 00 00 00 00 00 00 00  ........\n";
     );
     let rem = e.remaining_taint().expect("should have boundary taint");
     assert!(rem.mems.contains(&0x2000), "boundary taint must carry mem:0x2000");
-}
-
-// ─────────── Phase 1 semantic-tag regressions ───────────
-
-const PHASE1_FIXTURE: &str = "\
-libtiny.so!0fc 0x76fed9f0fc: \"\tmov\tx19, x0\" X0=0x100 => X19=0x100\n\
- -> libc.so!rand() ret: 0xdeadbeef\n\
-libtiny.so!104 0x76fed9f104: \"\tmov\tx1, x0\" X0=0xdeadbeef => X1=0xdeadbeef\n\
-libtiny.so!108 0x76fed9f108: \"\tldr\tx2, [x8]\" X8=0x2000 => X2=0x41\n\
-MEM R 0x2000 [8 bytes]: 41 00 00 00 00 00 00 00  A.......\n\
- -> libc.so!free(0x3000=\"phone=15965566655\") ret: 0x0\n\
-libtiny.so!10c 0x76fed9f10c: \"\tldr\tx3, [x5]\" X5=0x3000 => X3=0x313539\n\
-MEM R 0x3000 [8 bytes]: 31 35 39 36 35 35 36 36  15965566\n\
-";
-
-#[test]
-fn tag_table_detects_external_call_ret() {
-    let mut p = TraceParser::new();
-    p.load_from_bytes(PHASE1_FIXTURE.as_bytes());
-    let table = p.build_tag_table(PHASE1_FIXTURE.as_bytes());
-
-    // Walk every origin and collect ExternalCall callees.
-    let callees: Vec<String> = table
-        .iter_origins()
-        .filter_map(|(_, o)| match o {
-            TaintOrigin::ExternalCallRet { callee, .. } => Some(callee.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        callees.iter().any(|c| c == "libc.so!rand"),
-        "rand should be tagged as an external call; got: {:?}",
-        callees
-    );
-    assert!(
-        callees.iter().any(|c| c == "libc.so!free"),
-        "free should be tagged; got: {:?}",
-        callees
-    );
-}
-
-#[test]
-fn tag_table_extracts_payload_content() {
-    let mut p = TraceParser::new();
-    p.load_from_bytes(PHASE1_FIXTURE.as_bytes());
-    let table = p.build_tag_table(PHASE1_FIXTURE.as_bytes());
-
-    // PayloadByte range [0x3000, 0x3000 + len) must be registered and the
-    // lookup must succeed on an address inside it.
-    let tag = table
-        .tag_for_mem(0x3000)
-        .expect("payload address 0x3000 should be tagged");
-    match table.origin(tag).expect("tag must resolve") {
-        TaintOrigin::PayloadByte {
-            addr_lo,
-            content_preview,
-            ..
-        } => {
-            assert_eq!(*addr_lo, 0x3000);
-            assert!(
-                content_preview.starts_with(b"phone="),
-                "payload content should start with 'phone=', got {:?}",
-                String::from_utf8_lossy(content_preview)
-            );
-        }
-        other => panic!("expected PayloadByte, got {:?}", other),
-    }
-}
-
-#[test]
-fn tag_table_detects_const_mem() {
-    let mut p = TraceParser::new();
-    p.load_from_bytes(PHASE1_FIXTURE.as_bytes());
-    let table = p.build_tag_table(PHASE1_FIXTURE.as_bytes());
-
-    // 0x2000 is read once via `ldr x2, [x8]` and never written in the
-    // fixture → must appear as a ConstMem range.
-    let tag = table
-        .tag_for_mem(0x2000)
-        .expect("0x2000 should be const-tagged");
-    assert!(matches!(
-        table.origin(tag).unwrap(),
-        TaintOrigin::ConstMem { .. }
-    ));
-}
-
-#[test]
-fn external_call_x0_gets_tag_when_upstream_tainted() {
-    // Trace: x0 is tainted (source), enters bl foo (ExternalCall). After
-    // the call x0 should still be tainted AND carry the ExternalCallRet
-    // tag, because the callee consumed our upstream taint and its return
-    // value carries that input's semantics forward.
-    let fixture = "\
-libtiny.so!100 0x76fed9f100: \"\tmov\tx0, x9\" X9=0x1 => X0=0x1\n\
- -> libc.so!rand() ret: 0xdeadbeef\n\
-libtiny.so!108 0x76fed9f108: \"\tmov\tx2, x0\" X0=0xdeadbeef => X2=0xdeadbeef\n\
-";
-    let mut p = TraceParser::new();
-    p.load_from_bytes(fixture.as_bytes());
-    let table = std::sync::Arc::new(p.build_tag_table(fixture.as_bytes()));
-
-    let mut e = TaintEngine::new();
-    e.set_mode(TrackMode::Forward);
-    e.set_source(TaintSource::from_reg(parse_reg_name(b"x9")));
-    e.set_tag_table(table.clone());
-    e.run(p.lines(), 0);
-
-    // Find the ExternalCall entry in results.
-    let ext_idx = p
-        .lines()
-        .iter()
-        .position(|l| l.category == InsnCategory::ExternalCall)
-        .unwrap();
-    let ext_entry = e
-        .results()
-        .iter()
-        .find(|r| r.index == ext_idx)
-        .expect("external call should be recorded (upstream taint flowed in)");
-    let x0_nid = large_text_taint::reg::normalize(parse_reg_name(b"x0")) as usize;
-    assert!(
-        ext_entry.reg_snapshot[x0_nid],
-        "x0 must be re-tainted after the ExternalCall"
-    );
-    let tag = ext_entry.reg_tags[x0_nid];
-    assert!(
-        tag.is_tagged(),
-        "x0 must carry an ExternalCallRet tag after the call"
-    );
-    match table.origin(tag).unwrap() {
-        TaintOrigin::ExternalCallRet { callee, .. } => {
-            assert_eq!(callee, "libc.so!rand");
-        }
-        other => panic!("expected ExternalCallRet on x0, got {:?}", other),
-    }
 }
 
 /// Row-scoped snapshots: every backward result row must expose ONLY the
@@ -892,7 +670,9 @@ libtiny.so!114 0x76fed9f114: \"\tmov\tx0, x4\" X4=0x5000 => X0=0x5000\n\
         "start row must NOT carry x4 (x4 is a src here, not produced)"
     );
 
-    // mov x4, x3 — row snapshot must be exactly {x4, x3} (dst + src)
+    // mov x4, x3 — non-start row is INPUT-ONLY: snapshot is exactly {x3}.
+    // x4 (dst) is the already-resolved taint we came from; the backward
+    // walk now aims at x3, so that's the only reg to highlight.
     let mov_x4 = by_line
         .values()
         .find(|r| {
@@ -900,11 +680,17 @@ libtiny.so!114 0x76fed9f114: \"\tmov\tx0, x4\" X4=0x5000 => X0=0x5000\n\
             tl.num_dst >= 1 && tl.dst_regs[0] == parse_reg_name(b"x4")
         })
         .expect("mov x4, x3 row expected");
-    assert!(mov_x4.reg_snapshot[x4], "mov x4 row must contain x4 (dst)");
-    assert!(mov_x4.reg_snapshot[x3], "mov x4 row must contain x3 (src feeding x4)");
+    assert!(
+        mov_x4.reg_snapshot[x3],
+        "mov x4 row must contain x3 (new upstream target)"
+    );
+    assert!(
+        !mov_x4.reg_snapshot[x4],
+        "mov x4 row must NOT contain x4 (dst, already resolved)"
+    );
     assert!(!mov_x4.reg_snapshot[x0], "mov x4 row must NOT carry x0 downstream");
 
-    // mov x3, x10 — row snapshot must be exactly {x3, x10}
+    // mov x3, x10 — input-only: snapshot is exactly {x10}.
     let mov_x3 = by_line
         .values()
         .find(|r| {
@@ -912,10 +698,13 @@ libtiny.so!114 0x76fed9f114: \"\tmov\tx0, x4\" X4=0x5000 => X0=0x5000\n\
             tl.num_dst >= 1 && tl.dst_regs[0] == parse_reg_name(b"x3")
         })
         .expect("mov x3, x10 row expected");
-    assert!(mov_x3.reg_snapshot[x3], "mov x3 row must contain x3 (dst)");
     assert!(
         mov_x3.reg_snapshot[x10],
-        "mov x3 row must contain x10 (src feeding x3)"
+        "mov x3 row must contain x10 (new upstream target)"
+    );
+    assert!(
+        !mov_x3.reg_snapshot[x3],
+        "mov x3 row must NOT contain x3 (dst, already resolved)"
     );
     assert!(
         !mov_x3.reg_snapshot[x4],
@@ -927,49 +716,6 @@ libtiny.so!114 0x76fed9f114: \"\tmov\tx0, x4\" X4=0x5000 => X0=0x5000\n\
         !by_line.iter().any(|(_, r)| r.reg_snapshot[x11]),
         "unrelated mov w11 row must not appear — nothing downstream uses w11"
     );
-}
-
-#[test]
-fn boundary_report_lists_named_origins_for_const_mem() {
-    // Backward from a register that was last defined by a Load from a
-    // never-written address. The boundary should surface both the
-    // memory address AND its ConstMem tag so the report is self-
-    // explanatory.
-    let fixture = "\
-libtiny.so!100 0x76fed9f100: \"\tmov\tx5, x8\" X8=0x2000 => X5=0x2000\n\
-libtiny.so!104 0x76fed9f104: \"\tldr\tx0, [x5]\" X5=0x2000 => X0=0xaa\n\
-MEM R 0x2000 [8 bytes]: aa 00 00 00 00 00 00 00  ........\n\
-";
-    let mut p = TraceParser::new();
-    p.load_from_bytes(fixture.as_bytes());
-    let table = std::sync::Arc::new(p.build_tag_table(fixture.as_bytes()));
-
-    let ldr_idx = p
-        .lines()
-        .iter()
-        .position(|l| l.category == InsnCategory::Load)
-        .unwrap();
-
-    let mut e = TaintEngine::new();
-    e.set_mode(TrackMode::Backward);
-    e.set_source(TaintSource::from_reg(parse_reg_name(b"x0")));
-    e.set_tag_table(table.clone());
-    e.run(p.lines(), ldr_idx);
-
-    let rem = e
-        .remaining_taint()
-        .expect("boundary taint expected when load's mem is rodata");
-    assert!(rem.mems.contains(&0x2000));
-    let (_, tag) = rem
-        .mem_tags
-        .iter()
-        .find(|&&(a, _)| a == 0x2000)
-        .expect("mem_tags must include 0x2000");
-    assert!(tag.is_tagged(), "boundary mem must carry ConstMem tag");
-    assert!(matches!(
-        table.origin(*tag).unwrap(),
-        TaintOrigin::ConstMem { .. }
-    ));
 }
 
 /// Regression: in address-source (skip_start_propagation) mode,

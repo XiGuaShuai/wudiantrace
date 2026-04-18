@@ -139,3 +139,4 @@ fn parse_indexed(s: &[u8], base: RegId, max_n: u8) -> RegId {
     }
     REG_INVALID
 }
+
