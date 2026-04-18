@@ -57,6 +57,14 @@ pub struct TraceLine {
     /// or when the trace format never provides the second address (GumTrace
     /// native). Units: bytes. Zero = not a pair instruction.
     pub pair_reg_size: u8,
+
+    /// True when the last entry in `dst_regs` is a base register modified by
+    /// pre-/post-index writeback (e.g. `ldr x0, [x1]!` → dst = [x0, x1]
+    /// with writeback on x1). The writeback-base dst is always stored as the
+    /// last dst by the parser; its new value depends only on the old value
+    /// of the same register plus an immediate offset, so taint-wise it
+    /// should be treated as identity — not as a data load from memory.
+    pub has_writeback_base: bool,
 }
 
 impl Default for TraceLine {
@@ -85,6 +93,7 @@ impl Default for TraceLine {
             file_offset: 0,
             line_len: 0,
             pair_reg_size: 0,
+            has_writeback_base: false,
         }
     }
 }

@@ -382,3 +382,153 @@ libtiny.so!1014 0x70001014: \"\tadd\tx0, x27, x1\" X27=0xBB, X1=0x10 => X0=0xCB
         "should NOT hit adrp x27 #0x2000 (wrong value 0xCC)"
     );
 }
+
+// ─────────────── regressions for recent bug fixes ───────────────
+
+/// Pre-index writeback (`stp x29, x30, [sp, #-0x60]!`) must mark `sp` as dst
+/// so forward taint sees SP being redefined and backward tracking can chain
+/// through it.
+#[test]
+fn writeback_pre_index_adds_base_as_dst() {
+    let mut p = TraceParser::new();
+    p.load_from_bytes(
+        b"libtiny.so!100 0x76fed9f100: \"\tstp\tx29, x30, [sp, #-0x60]!\" \
+          FP=0x0, LR=0x0, SP=0x1000 => SP=0xfa0\n",
+    );
+    let tl = &p.lines()[0];
+    assert!(tl.has_writeback_base, "stp ...]! must set has_writeback_base");
+    // Store fixture: sp is the last dst (writeback base).
+    assert!(
+        (0..tl.num_dst as usize).any(|j| tl.dst_regs[j] == parse_reg_name(b"sp")),
+        "sp must be in dst_regs for pre-index stp"
+    );
+}
+
+/// Post-index writeback (`ldr x0, [x1], #8`) must mark `x1` as dst.
+#[test]
+fn writeback_post_index_adds_base_as_dst() {
+    let mut p = TraceParser::new();
+    p.load_from_bytes(
+        b"libtiny.so!100 0x76fed9f100: \"\tldr\tx0, [x1], #8\" X1=0x1000 => X0=0x0, X1=0x1008\n",
+    );
+    let tl = &p.lines()[0];
+    assert!(
+        tl.has_writeback_base,
+        "ldr [x1], #imm must set has_writeback_base"
+    );
+    // LDR writeback: dst = [x0, x1], x1 (writeback base) is dst[1].
+    assert_eq!(tl.num_dst, 2);
+    assert_eq!(tl.dst_regs[0], parse_reg_name(b"x0"));
+    assert_eq!(tl.dst_regs[1], parse_reg_name(b"x1"));
+}
+
+/// Same-reg load without `!` (e.g. `ldr x0, [x0, #8]`) must NOT be flagged as
+/// writeback — otherwise the writeback handling would wrongly treat x0 as
+/// depending only on itself.
+#[test]
+fn same_reg_load_without_bang_is_not_writeback() {
+    let mut p = TraceParser::new();
+    p.load_from_bytes(
+        b"libtiny.so!100 0x76fed9f100: \"\tldr\tx0, [x0, #8]\" X0=0x1000 => X0=0x5\n",
+    );
+    let tl = &p.lines()[0];
+    assert!(
+        !tl.has_writeback_base,
+        "no `!` and no post-index offset — not a writeback"
+    );
+}
+
+/// Bug 1 regression: backward tracking from a memory source used to return
+/// only the start line (mem_preds was never consulted). Now it must chain
+/// back to the store that last wrote that address.
+#[test]
+fn backward_mem_source_chains_to_prior_store() {
+    let src = "\
+libtiny.so!100 0x76fed9f100: \"\tmov\tx0, #0xabc\" => X0=0xabc\n\
+libtiny.so!104 0x76fed9f104: \"\tmov\tx1, sp\" SP=0x2000 => X1=0x2000\n\
+libtiny.so!108 0x76fed9f108: \"\tstr\tx0, [x1]\" X0=0xabc, X1=0x2000\n\
+MEM W 0x2000 [8 bytes]: bc 0a 00 00 00 00 00 00  ........\n\
+libtiny.so!10c 0x76fed9f10c: \"\tldr\tx2, [x1]\" X1=0x2000 => X2=0xabc\n\
+MEM R 0x2000 [8 bytes]: bc 0a 00 00 00 00 00 00  ........\n";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(src.as_bytes());
+    let mut e = TaintEngine::new();
+    e.set_mode(TrackMode::Backward);
+    e.set_source(TaintSource::from_mem(0x2000));
+    // Start from the ldr (reads mem:0x2000); expect to reach the str.
+    let ldr_idx = p.lines().iter().position(|l| l.category == InsnCategory::Load).unwrap();
+    e.run(p.lines(), ldr_idx);
+    let results = e.results();
+    assert!(
+        results.len() >= 2,
+        "backward mem-source must chain to prior store, got {} entries",
+        results.len()
+    );
+    let str_idx = p.lines().iter().position(|l| l.category == InsnCategory::Store).unwrap();
+    assert!(
+        results.iter().any(|r| r.index == str_idx),
+        "must visit the str that wrote mem:0x2000"
+    );
+}
+
+/// Bug 3 regression: forward CondSelect must observe NZCV-taint, even when no
+/// data-reg src is tainted.
+#[test]
+fn forward_condselect_follows_nzcv_taint() {
+    // `start_index` is only recorded, not propagated; use a nop as the
+    // starting anchor so cmp actually runs.
+    let src = "\
+libtiny.so!0fc 0x76fed9f0fc: \"\tnop\"\n\
+libtiny.so!100 0x76fed9f100: \"\tcmp\tx5, x6\" X5=0x1, X6=0x2\n\
+libtiny.so!104 0x76fed9f104: \"\tcsel\tx0, x1, x2, eq\" X1=0xaa, X2=0xbb => X0=0xbb\n";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(src.as_bytes());
+    let mut e = TaintEngine::new();
+    e.set_mode(TrackMode::Forward);
+    // Taint x5 so cmp taints NZCV. csel then must taint x0 through NZCV.
+    e.set_source(TaintSource::from_reg(parse_reg_name(b"x5")));
+    e.run(p.lines(), 0);
+    let csel_idx = p.lines().iter().position(|l| l.category == InsnCategory::CondSelect).unwrap();
+    let csel_entry = e.results().iter().find(|r| r.index == csel_idx)
+        .expect("csel should be recorded as involved");
+    let x0_nid = large_text_taint::reg::normalize(parse_reg_name(b"x0")) as usize;
+    assert!(
+        csel_entry.reg_snapshot[x0_nid],
+        "csel must taint x0 when NZCV is tainted"
+    );
+}
+
+/// Bug 4 regression: ExternalCall must clear LR and q0..q7 (AAPCS64
+/// caller-saved).
+#[test]
+fn external_call_clears_lr_and_q0() {
+    use large_text_taint::reg::{normalize, REG_LR, REG_Q0};
+    let src = "\
+libtiny.so!100 0x76fed9f100: \"\tmov\tx19, x0\" X0=0x1 => X19=0x1\n\
+libtiny.so!104 0x76fed9f104: \"\tbl\t#0x200\" => LR=0x108\n\
+ -> libc.so!malloc(1024) ret: 0x7800\n\
+libtiny.so!108 0x76fed9f108: \"\tmov\tx20, x0\" X0=0x7800 => X20=0x7800\n";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(src.as_bytes());
+    let mut e = TaintEngine::new();
+    e.set_mode(TrackMode::Forward);
+    // Taint LR and q0 — both must be cleared after ExternalCall.
+    e.set_source(TaintSource::from_reg(REG_LR));
+    e.run(p.lines(), 0);
+    // After the external call the LR taint must be gone.
+    let last = e.results().last().expect("at least start entry");
+    assert!(
+        !last.reg_snapshot[normalize(REG_LR) as usize],
+        "LR must be cleared by ExternalCall"
+    );
+
+    let mut e2 = TaintEngine::new();
+    e2.set_mode(TrackMode::Forward);
+    e2.set_source(TaintSource::from_reg(REG_Q0));
+    e2.run(p.lines(), 0);
+    let last2 = e2.results().last().expect("at least start entry");
+    assert!(
+        !last2.reg_snapshot[normalize(REG_Q0) as usize],
+        "q0 must be cleared by ExternalCall"
+    );
+}

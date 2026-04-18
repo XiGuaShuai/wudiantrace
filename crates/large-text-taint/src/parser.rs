@@ -7,7 +7,7 @@
 use memchr::memchr;
 use memchr::memmem;
 
-use crate::reg::{parse_reg_name, REG_INVALID};
+use crate::reg::{parse_reg_name, RegId, REG_INVALID};
 use crate::trace::{classify_mnemonic, InsnCategory, TraceLine};
 
 /// Truncates to the low 64 bits when input has more than 16 hex digits
@@ -404,11 +404,15 @@ impl TraceParser {
             start: usize,
             len: usize,
             is_mem: bool,
+            /// Base register is writeback (pre-index `[reg, #imm]!` or
+            /// post-index `[reg], #imm`). Only valid on mem operands.
+            writeback: bool,
         }
         let mut operands: [Operand; 8] = std::array::from_fn(|_| Operand {
             start: 0,
             len: 0,
             is_mem: false,
+            writeback: false,
         });
         let mut num_ops = 0usize;
         let mut bracket = 0i32;
@@ -435,10 +439,13 @@ impl TraceParser {
                     }
                     if e > s {
                         let mem = ops[s..e].contains(&b'[');
+                        // Pre-index writeback: [reg, #imm]! (trailing '!').
+                        let pre_wb = mem && ops[e - 1] == b'!';
                         operands[num_ops] = Operand {
                             start: s,
                             len: e - s,
                             is_mem: mem,
+                            writeback: pre_wb,
                         };
                         num_ops += 1;
                     }
@@ -450,6 +457,22 @@ impl TraceParser {
 
         if num_ops == 0 {
             return;
+        }
+
+        // Post-index writeback: a mem operand that is NOT the last operand
+        // (e.g. `ldr x0, [x1], #8` or `str x0, [x1], x2`). Only applies to
+        // load/store; for other categories a trailing operand after a mem
+        // operand would be a shift/extend modifier, not a writeback offset.
+        let is_ldst = matches!(
+            out.category,
+            InsnCategory::Load | InsnCategory::Store
+        );
+        if is_ldst {
+            for (idx, op) in operands.iter_mut().enumerate().take(num_ops) {
+                if op.is_mem && !op.writeback && idx + 1 < num_ops {
+                    op.writeback = true;
+                }
+            }
         }
 
         let mut tok = [0u8; 8];
@@ -486,7 +509,12 @@ impl TraceParser {
             for op in &operands[..num_ops] {
                 let segment = &ops[op.start..op.start + op.len];
                 if op.is_mem {
-                    extract_mem_regs(segment, out);
+                    let base = extract_mem_regs(segment, out);
+                    if op.writeback && base != REG_INVALID && (out.num_dst as usize) < 4 {
+                        out.dst_regs[out.num_dst as usize] = base;
+                        out.num_dst += 1;
+                        out.has_writeback_base = true;
+                    }
                 } else {
                     let n = extract_token(segment, &mut tok);
                     let rid = parse_reg_name(&tok[..n]);
@@ -503,7 +531,12 @@ impl TraceParser {
         for (idx, op) in operands[..num_ops].iter().enumerate() {
             let segment = &ops[op.start..op.start + op.len];
             if op.is_mem {
-                extract_mem_regs(segment, out);
+                let base = extract_mem_regs(segment, out);
+                if op.writeback && base != REG_INVALID && (out.num_dst as usize) < 4 {
+                    out.dst_regs[out.num_dst as usize] = base;
+                    out.num_dst += 1;
+                    out.has_writeback_base = true;
+                }
                 continue;
             }
             if segment[0] == b'#' {
@@ -674,7 +707,10 @@ fn parse_reg_val_in(section: &[u8], target_reg: crate::reg::RegId) -> Option<u64
     None
 }
 
-fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) {
+/// Extract register operands from a `[...]` memory operand segment.
+/// Returns the base register (first register found) or `REG_INVALID` if none.
+fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) -> RegId {
+    let mut base = REG_INVALID;
     let mut tok = [0u8; 8];
     for j in 0..segment.len() {
         let c = segment[j];
@@ -687,12 +723,16 @@ fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) {
                 let n = extract_token(&segment[k..], &mut tok);
                 let rid = parse_reg_name(&tok[..n]);
                 if rid != REG_INVALID && (out.num_src as usize) < 8 {
+                    if base == REG_INVALID {
+                        base = rid;
+                    }
                     out.src_regs[out.num_src as usize] = rid;
                     out.num_src += 1;
                 }
             }
         }
     }
+    base
 }
 
 /// Inspect the mnemonic + first operand to decide whether this is a paired

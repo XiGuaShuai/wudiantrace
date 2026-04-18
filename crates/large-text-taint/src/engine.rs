@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::parser::read_raw_line;
-use crate::reg::{normalize, reg_name, RegId, REG_INVALID, REG_NZCV, REG_XZR};
+use crate::reg::{normalize, reg_name, RegId, REG_INVALID, REG_LR, REG_NZCV, REG_Q0, REG_XZR};
 use crate::trace::{InsnCategory, TraceLine};
 
 const NO_DEF: u32 = u32::MAX;
@@ -188,8 +188,13 @@ impl DepGraphBuilder {
             // Update definitions
             match line.category {
                 InsnCategory::ExternalCall => {
+                    // AAPCS64 caller-saved: x0..x18, x30 (LR), q0..q7, NZCV.
                     for r in 0..=18u8 {
                         self.set_reg_def(r, i as u32);
+                    }
+                    self.set_reg_def(REG_LR, i as u32);
+                    for r in 0..8u8 {
+                        self.set_reg_def(REG_Q0 + r, i as u32);
                     }
                     self.reg_last_def[REG_NZCV as usize] = i as u32;
                 }
@@ -220,6 +225,17 @@ impl DepGraphBuilder {
 fn push_unique_reg(v: &mut SmallVec<[(u8, u32); 4]>, nid: u8, pred: u32) {
     if !v.iter().any(|&(n, _)| n == nid) {
         v.push((nid, pred));
+    }
+}
+
+/// Index of the writeback-base dst within `dst_regs`, or `None`. Parser
+/// places the writeback base as the last dst when present.
+#[inline]
+fn writeback_dst_idx(line: &TraceLine) -> Option<usize> {
+    if line.has_writeback_base && line.num_dst > 0 {
+        Some((line.num_dst - 1) as usize)
+    } else {
+        None
     }
 }
 
@@ -261,11 +277,22 @@ fn taint_guided_collect(
     } else {
         visited[start_index] = true;
         count += 1;
-        let nid = normalize(source.reg);
-        for &(rn, pred) in &deps[start_index].reg_preds {
-            if rn == nid {
-                queue.push_back((pred, 1));
-                break;
+        if source.is_mem {
+            // Mem-source backward: find the predecessor that last wrote
+            // the target address.
+            for &(addr, pred) in &deps[start_index].mem_preds {
+                if addr == source.mem_addr {
+                    queue.push_back((pred, 1));
+                    break;
+                }
+            }
+        } else {
+            let nid = normalize(source.reg);
+            for &(rn, pred) in &deps[start_index].reg_preds {
+                if rn == nid {
+                    queue.push_back((pred, 1));
+                    break;
+                }
             }
         }
     }
@@ -281,11 +308,15 @@ fn taint_guided_collect(
 
         let line = &lines[ui];
 
-        // Check which outputs are active
-        let mut dst_active = false;
+        // Per-dst active bitmap (needed to route LDP-pair mem correctly and
+        // to re-activate writeback base registers after clearing dst).
+        let mut dst_active_mask: u32 = 0;
         for j in 0..line.num_dst as usize {
-            if active_regs[normalize(line.dst_regs[j]) as usize] { dst_active = true; }
+            if active_regs[normalize(line.dst_regs[j]) as usize] {
+                dst_active_mask |= 1 << j;
+            }
         }
+        let dst_active = dst_active_mask != 0;
         let nzcv_active = line.sets_flags && active_regs[REG_NZCV as usize];
         let mem_w_active = line.has_mem_write && active_mem.contains_key(&line.mem_write_addr);
         let mem_w2_active = line.has_mem_write2 && active_mem.contains_key(&line.mem_write_addr2);
@@ -305,14 +336,33 @@ fn taint_guided_collect(
         if mem_w_active { active_mem.remove(&line.mem_write_addr); }
         if mem_w2_active { active_mem.remove(&line.mem_write_addr2); }
 
+        // Writeback base (pre/post-index): new base = old base + imm, same
+        // register — re-activate after the blanket clear above.
+        let wb_idx = writeback_dst_idx(line);
+        if let Some(wi) = wb_idx {
+            if (dst_active_mask >> wi) & 1 != 0 {
+                active_regs[normalize(line.dst_regs[wi]) as usize] = true;
+            }
+        }
+
         match line.category {
             InsnCategory::ImmLoad | InsnCategory::ExternalCall => {}
             InsnCategory::Load => {
                 // Only follow the data chain through memory.
                 // Address registers are NOT added to active — they are
                 // a separate concern ("向后追踪地址来源" menu).
-                if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
-                if line.has_mem_read2 { active_mem.insert(line.mem_read_addr2, ()); }
+                // Route mem reads by which data-dst was active:
+                //   LDP: dst[0] ↔ read_addr, dst[1] ↔ read_addr2
+                //   LDR: dst[0] ↔ read_addr (single read)
+                //   Writeback base dst is skipped (handled above).
+                let d0_data = (dst_active_mask & 1) != 0 && wb_idx != Some(0);
+                let d1_data = (dst_active_mask & 2) != 0 && wb_idx != Some(1);
+                if line.has_mem_read2 {
+                    if d0_data { active_mem.insert(line.mem_read_addr, ()); }
+                    if d1_data { active_mem.insert(line.mem_read_addr2, ()); }
+                } else if d0_data && line.has_mem_read {
+                    active_mem.insert(line.mem_read_addr, ());
+                }
             }
             InsnCategory::Store => {
                 if mem_w_active && line.num_src > 0 { active_regs[normalize(line.src_regs[0]) as usize] = true; }
@@ -320,6 +370,9 @@ fn taint_guided_collect(
             }
             InsnCategory::CondSelect => {
                 for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                // csel depends on NZCV; dep-graph recorded the edge but the
+                // traversal only follows edges whose nid is in active_regs.
+                active_regs[REG_NZCV as usize] = true;
             }
             _ => {
                 for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
@@ -370,10 +423,13 @@ fn rebuild_snapshots(
     for &idx in visited.iter().rev() {
         let line = &lines[idx];
 
-        let mut dst_active = false;
+        let mut dst_active_mask: u32 = 0;
         for j in 0..line.num_dst as usize {
-            if active_regs[normalize(line.dst_regs[j]) as usize] { dst_active = true; }
+            if active_regs[normalize(line.dst_regs[j]) as usize] {
+                dst_active_mask |= 1 << j;
+            }
         }
+        let dst_active = dst_active_mask != 0;
         let nzcv_active = line.sets_flags && active_regs[REG_NZCV as usize];
         let mem_w_active = line.has_mem_write && active_mem.contains_key(&line.mem_write_addr);
         let mem_w2_active = line.has_mem_write2 && active_mem.contains_key(&line.mem_write_addr2);
@@ -386,12 +442,27 @@ fn rebuild_snapshots(
             if mem_w_active { active_mem.remove(&line.mem_write_addr); }
             if mem_w2_active { active_mem.remove(&line.mem_write_addr2); }
 
+            // Writeback base: re-activate (same reg as before, just updated).
+            let wb_idx = writeback_dst_idx(line);
+            if let Some(wi) = wb_idx {
+                if (dst_active_mask >> wi) & 1 != 0 {
+                    active_regs[normalize(line.dst_regs[wi]) as usize] = true;
+                }
+            }
+
             match line.category {
                 InsnCategory::ImmLoad | InsnCategory::ExternalCall => {}
                 InsnCategory::Load => {
-                    if line.has_mem_read { active_mem.insert(line.mem_read_addr, ()); }
-                    if line.has_mem_read2 { active_mem.insert(line.mem_read_addr2, ()); }
-                    for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                    // Same routing as taint_guided_collect: data-dst only,
+                    // and do NOT add address-regs (data-only backward chain).
+                    let d0_data = (dst_active_mask & 1) != 0 && wb_idx != Some(0);
+                    let d1_data = (dst_active_mask & 2) != 0 && wb_idx != Some(1);
+                    if line.has_mem_read2 {
+                        if d0_data { active_mem.insert(line.mem_read_addr, ()); }
+                        if d1_data { active_mem.insert(line.mem_read_addr2, ()); }
+                    } else if d0_data && line.has_mem_read {
+                        active_mem.insert(line.mem_read_addr, ());
+                    }
                 }
                 InsnCategory::Store => {
                     if mem_w_active && line.num_src > 0 { active_regs[normalize(line.src_regs[0]) as usize] = true; }
@@ -399,6 +470,7 @@ fn rebuild_snapshots(
                 }
                 InsnCategory::CondSelect => {
                     for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
+                    active_regs[REG_NZCV as usize] = true;
                 }
                 _ => {
                     for j in 0..line.num_src as usize { active_regs[normalize(line.src_regs[j]) as usize] = true; }
@@ -524,12 +596,17 @@ impl TaintEngine {
     }
 
     fn any_caller_saved_tainted(&self) -> bool {
+        // AAPCS64 caller-saved: x0..x18, x30 (LR), q0..q7, NZCV.
         for reg_id in 0..=18u8 { if self.is_reg_tainted(reg_id) { return true; } }
+        if self.is_reg_tainted(REG_LR) { return true; }
+        for i in 0..8u8 { if self.is_reg_tainted(REG_Q0 + i) { return true; } }
         self.is_reg_tainted(REG_NZCV)
     }
 
     fn untaint_caller_saved(&mut self) {
         for reg_id in 0..=18u8 { self.untaint_reg(reg_id); }
+        self.untaint_reg(REG_LR);
+        for i in 0..8u8 { self.untaint_reg(REG_Q0 + i); }
         self.untaint_reg(REG_NZCV);
     }
 
@@ -558,7 +635,7 @@ impl TaintEngine {
             }
             ExternalCall => { self.untaint_caller_saved(); }
             PartialModify => {}
-            DataMove | Arithmetic | Logic | ShiftExt | Bitfield | CondSelect => {
+            DataMove | Arithmetic | Logic | ShiftExt | Bitfield => {
                 let src_t = self.any_src_tainted(line);
                 for i in 0..line.num_dst as usize {
                     if src_t { self.taint_reg(line.dst_regs[i]); }
@@ -568,8 +645,23 @@ impl TaintEngine {
                     if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
                 }
             }
+            CondSelect => {
+                // csel/csinc/... depends on the chosen srcs AND NZCV.
+                let src_t = self.any_src_tainted(line) || self.is_reg_tainted(REG_NZCV);
+                for i in 0..line.num_dst as usize {
+                    if src_t { self.taint_reg(line.dst_regs[i]); }
+                    else { self.untaint_reg(line.dst_regs[i]); }
+                }
+                if line.sets_flags {
+                    if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
+                }
+            }
             Load => {
+                let wb_idx = writeback_dst_idx(line);
                 if line.has_mem_read2 && line.num_dst >= 2 {
+                    // LDP data pair: dst[0]↔read_addr, dst[1]↔read_addr2.
+                    // Writeback base (if any) is dst[last], skipped here so
+                    // its taint carries over unchanged from the old base.
                     let mt1 = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
                     let mt2 = self.tainted_mem.contains_key(&line.mem_read_addr2);
                     if mt1 { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); self.taint_reg(line.dst_regs[0]); }
@@ -580,6 +672,7 @@ impl TaintEngine {
                     let mt = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
                     if mt { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); }
                     for i in 0..line.num_dst as usize {
+                        if wb_idx == Some(i) { continue; } // keep writeback base's taint
                         if mt { self.taint_reg(line.dst_regs[i]); } else { self.untaint_reg(line.dst_regs[i]); }
                     }
                 }
@@ -650,6 +743,7 @@ impl TaintEngine {
                     let line = &lines[i];
                     let mut involved = self.any_src_tainted(line);
                     if !involved && line.category == InsnCategory::ExternalCall && self.any_caller_saved_tainted() { involved = true; }
+                    if !involved && line.category == InsnCategory::CondSelect && self.is_reg_tainted(REG_NZCV) { involved = true; }
                     if !involved && line.has_mem_write && self.tainted_mem.contains_key(&line.mem_write_addr) { involved = true; }
                     if !involved && line.has_mem_write2 && self.tainted_mem.contains_key(&line.mem_write_addr2) { involved = true; }
                     self.propagate_forward(line, i);
