@@ -1364,16 +1364,6 @@ impl TextViewerApp {
                         let count = row_range.end - row_range.start;
                         let render_range = corrected_start_line..(corrected_start_line + count);
 
-                        // Measure monospace character width once for
-                        // double-click word extraction.
-                        let mono_char_width = {
-                            let font_id = egui::FontId::monospace(self.font_size);
-                            ui.fonts(|f| {
-                                f.layout_no_wrap("A".to_string(), font_id, egui::Color32::WHITE)
-                                    .rect
-                                    .width()
-                            })
-                        };
 
                         for line_num in render_range {
                             // Read line starting at current_offset
@@ -1488,14 +1478,24 @@ impl TextViewerApp {
                             }
 
                             // Occurrence highlight: find all occurrences of the
-                            // double-clicked word in this line.
+                            // double-clicked word in this line. Require word
+                            // boundaries so "x1" doesn't highlight inside
+                            // "x10".."x19" (register tokens are
+                            // alphanumeric+underscore).
                             if let Some(ref occ_word) = self.occurrence_word {
+                                let bytes = line_text.as_bytes();
                                 let mut search_from = 0;
                                 while search_from < line_text.len() {
                                     if let Some(pos) = line_text[search_from..].find(occ_word.as_str()) {
                                         let abs_start = search_from + pos;
                                         let abs_end = abs_start + occ_word.len();
-                                        line_matches.push((abs_start, abs_end, false, true));
+                                        let left_ok = abs_start == 0
+                                            || !is_word_byte(bytes[abs_start - 1]);
+                                        let right_ok = abs_end >= bytes.len()
+                                            || !is_word_byte(bytes[abs_end]);
+                                        if left_ok && right_ok {
+                                            line_matches.push((abs_start, abs_end, false, true));
+                                        }
                                         search_from = abs_end;
                                     } else {
                                         break;
@@ -1662,8 +1662,23 @@ impl TextViewerApp {
                                 // highlight all same words in the viewport.
                                 if label.double_clicked() {
                                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                                        let rel_x = pos.x - label.rect.left();
-                                        let char_idx = (rel_x / mono_char_width).floor() as usize;
+                                        // Layout the line once to translate the
+                                        // click position into a char index.
+                                        // Using the galley handles tabs, wide
+                                        // chars, and kerning precisely — unlike
+                                        // rel_x / mono_char_width, which drifts
+                                        // on any line containing '\t'.
+                                        let rel = pos - label.rect.left_top();
+                                        let font_id = egui::FontId::monospace(self.font_size);
+                                        let galley = ui.fonts(|f| {
+                                            f.layout_no_wrap(
+                                                line_text.to_string(),
+                                                font_id,
+                                                egui::Color32::TRANSPARENT,
+                                            )
+                                        });
+                                        let cursor = galley.cursor_from_pos(rel);
+                                        let char_idx = cursor.ccursor.index;
                                         let word = extract_word_at(line_text, char_idx);
                                         if word.is_empty() {
                                             self.occurrence_word = None;
@@ -2402,6 +2417,10 @@ fn extract_word_at(text: &str, char_idx: usize) -> String {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn preview_for_match(reader: &FileReader, m: &SearchResult) -> String {
