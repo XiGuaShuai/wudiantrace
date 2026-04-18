@@ -1694,10 +1694,20 @@ impl TextViewerApp {
                                 // Right-click: taint tracking menu for this line.
                                 label.clone().context_menu(|ui| {
                                     let start_line_1based = (line_num as u32).saturating_add(1);
-                                    // Parse this single line so we can offer one-click quick
-                                    // targets for its registers / memory operands.
+                                    // Parse the instruction PLUS any follow-up `MEM R/W`
+                                    // lines so the quick-target menu can offer mem:0x...
+                                    // entries for Load/Store. Grab a few KB past the
+                                    // current line from the mmap so the follow-ups are
+                                    // included — parse_single_line falls back to the
+                                    // single-line slice if file_reader isn't available.
+                                    let ctx_bytes: Vec<u8> = if let Some(ref reader) = self.file_reader {
+                                        let end_with_mem = (start + 4096).min(reader.len());
+                                        reader.get_bytes(start, end_with_mem).to_vec()
+                                    } else {
+                                        line_text.as_bytes().to_vec()
+                                    };
                                     let parsed = large_text_taint::parser::TraceParser::parse_single_line(
-                                        line_text.as_bytes(),
+                                        &ctx_bytes,
                                         start_line_1based,
                                         0,
                                     );

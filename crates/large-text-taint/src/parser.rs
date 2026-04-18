@@ -278,22 +278,33 @@ impl TraceParser {
         }
     }
 
-    /// Parse a single candidate instruction line in isolation (no MEM R/W
-    /// follow-up lines are attached). Returns `None` when the line is not an
-    /// xgtrace instruction line. Useful for UI previews that need to know
-    /// which registers a single line touches without loading the whole file.
+    /// Parse a single candidate instruction line and attach any `MEM R/W`
+    /// follow-up lines present in `bytes`. Returns `None` when the first
+    /// line isn't a parseable xgtrace instruction.
+    ///
+    /// Callers that already have a multi-line byte range (e.g. the mmap
+    /// window around the clicked line) should pass a slice that starts at
+    /// the instruction line and extends a few KB further — the `MEM R/W`
+    /// lines that sit below the instruction will be picked up and written
+    /// into `mem_read_addr` / `mem_write_addr` / ... on the returned
+    /// [`TraceLine`]. Passing just a single-line slice still works but the
+    /// memory-operand fields will stay empty, and any UI that relies on
+    /// them (e.g. the right-click "trace mem:0x..." menu entry) will miss
+    /// the mem targets.
     pub fn parse_single_line(bytes: &[u8], line_number: u32, offset: u64) -> Option<TraceLine> {
-        let mut tl = TraceLine::default();
-        // strip trailing newline/cr so parse_line sees just the content
-        let mut end = bytes.len();
-        while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
-            end -= 1;
-        }
-        if Self::parse_line(&bytes[..end], line_number, offset, &mut tl) {
-            Some(tl)
-        } else {
-            None
-        }
+        // Run the full parser over the slice so MEM R/W lines following
+        // the instruction get attached. We only look at the first parsed
+        // instruction; cap to a small line-count so a slice accidentally
+        // containing many instructions doesn't waste time.
+        let mut p = Self::new();
+        p.load_range(bytes, 8, bytes.len() as u64);
+        let mut tl = p.lines.into_iter().next()?;
+        // Override with the caller-supplied identity so UI code that tracks
+        // a specific trace-file line number / byte offset sees consistent
+        // values regardless of the slice's internal position.
+        tl.line_number = line_number;
+        tl.file_offset = offset;
+        Some(tl)
     }
 
     /// Parse one xgtrace instruction line. Returns true on success.
