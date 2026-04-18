@@ -6,8 +6,10 @@
 
 use memchr::memchr;
 use memchr::memmem;
+use rustc_hash::FxHashSet;
 
 use crate::reg::{parse_reg_name, RegId, REG_INVALID};
+use crate::tag::{TagTable, TaintOrigin, PAYLOAD_PREVIEW_MAX};
 use crate::trace::{classify_mnemonic, InsnCategory, TraceLine};
 
 /// Truncates to the low 64 bits when input has more than 16 hex digits
@@ -510,6 +512,9 @@ impl TraceParser {
                 let segment = &ops[op.start..op.start + op.len];
                 if op.is_mem {
                     let base = extract_mem_regs(segment, out);
+                    if out.mem_base_reg == REG_INVALID {
+                        out.mem_base_reg = base;
+                    }
                     if op.writeback && base != REG_INVALID && (out.num_dst as usize) < 4 {
                         out.dst_regs[out.num_dst as usize] = base;
                         out.num_dst += 1;
@@ -532,6 +537,9 @@ impl TraceParser {
             let segment = &ops[op.start..op.start + op.len];
             if op.is_mem {
                 let base = extract_mem_regs(segment, out);
+                if out.mem_base_reg == REG_INVALID {
+                    out.mem_base_reg = base;
+                }
                 if op.writeback && base != REG_INVALID && (out.num_dst as usize) < 4 {
                     out.dst_regs[out.num_dst as usize] = base;
                     out.num_dst += 1;
@@ -615,6 +623,291 @@ impl TraceParser {
         self.lines.iter().position(|l| l.rel_addr == rel_addr)
     }
 
+    /// Build the semantic [`TagTable`] for this parsed trace.
+    ///
+    /// Runs three passes over the already-parsed `lines` and, for
+    /// ExternalCall lines, re-reads the raw bytes to extract callee
+    /// names, argument previews, return values, and embedded payload
+    /// strings (which may span multiple physical lines).
+    ///
+    /// Pass 1: build a set of every `mem_write_addr` touched in the
+    /// trace, plus a sorted list of every `mem_read_addr`. Read
+    /// addresses that are never written are coalesced into
+    /// [`TaintOrigin::ConstMem`] ranges.
+    ///
+    /// Pass 2: walk every `ExternalCall` line, parse `callee(args) ret: V`
+    /// from the raw bytes, and record a [`TaintOrigin::ExternalCallRet`]
+    /// tag keyed by line index. Any `0xADDR="..."` argument is also
+    /// registered as a [`TaintOrigin::PayloadByte`] range so the trace's
+    /// mem tag index reflects the payload's bytes.
+    pub fn build_tag_table(&self, bytes: &[u8]) -> TagTable {
+        let mut table = TagTable::new();
+
+        // ── Pass 1 — const mem (reads never matched by a write) ──────
+        let mut writes: FxHashSet<u64> = FxHashSet::default();
+        for tl in &self.lines {
+            if tl.has_mem_write {
+                writes.insert(tl.mem_write_addr);
+            }
+            if tl.has_mem_write2 {
+                writes.insert(tl.mem_write_addr2);
+            }
+        }
+
+        let mut reads: Vec<u64> = Vec::new();
+        for tl in &self.lines {
+            if tl.has_mem_read && !writes.contains(&tl.mem_read_addr) {
+                reads.push(tl.mem_read_addr);
+            }
+            if tl.has_mem_read2 && !writes.contains(&tl.mem_read_addr2) {
+                reads.push(tl.mem_read_addr2);
+            }
+        }
+        reads.sort_unstable();
+        reads.dedup();
+
+        // Coalesce contiguous-ish runs into a single [lo, hi) range.
+        // A gap threshold of 64 bytes keeps typical packed rodata tables
+        // together while still splitting off clearly unrelated regions.
+        const ADDR_ASSUMED_WIDTH: u64 = 8;
+        const CONST_MERGE_GAP: u64 = 64;
+        let mut i = 0;
+        while i < reads.len() {
+            let lo = reads[i];
+            let mut hi = lo + ADDR_ASSUMED_WIDTH;
+            let mut j = i + 1;
+            while j < reads.len() && reads[j] <= hi + CONST_MERGE_GAP {
+                hi = reads[j] + ADDR_ASSUMED_WIDTH;
+                j += 1;
+            }
+            let origin = TaintOrigin::ConstMem {
+                addr_lo: lo,
+                addr_hi: hi,
+                module: None,
+                offset: None,
+            };
+            let tag = table.intern(origin);
+            table.add_mem_range(lo, hi, tag);
+            i = j;
+        }
+
+        // ── Pass 2 — ExternalCall metadata + payload extraction ──────
+        for (idx, tl) in self.lines.iter().enumerate() {
+            if tl.category != InsnCategory::ExternalCall {
+                continue;
+            }
+            // ExternalCall text may span several physical lines when the
+            // argument preview contains embedded newlines. Read up to the
+            // next parsed TraceLine's starting offset (or end of bytes).
+            let extent_hi = self
+                .lines
+                .get(idx + 1)
+                .map(|next| next.file_offset as usize)
+                .unwrap_or(bytes.len());
+            let start = tl.file_offset as usize;
+            if start >= bytes.len() {
+                continue;
+            }
+            let end = extent_hi.min(bytes.len());
+            let slice = &bytes[start..end];
+
+            if let Some(info) = parse_external_call(slice) {
+                // ExternalCall return tag for x0.
+                let ret_origin = TaintOrigin::ExternalCallRet {
+                    line_index: idx as u32,
+                    callee: info.callee,
+                    args_preview: info.args_preview.clone(),
+                    ret_val: info.ret_val.unwrap_or(0),
+                };
+                table.register_ext_call(idx as u32, ret_origin);
+
+                // Any `0xADDR="..."` payload becomes a PayloadByte range.
+                for p in info.payloads {
+                    let payload_id = table.alloc_payload_id();
+                    let content_len = p.content.len() as u32;
+                    let preview_len = p.content.len().min(PAYLOAD_PREVIEW_MAX);
+                    let payload_origin = TaintOrigin::PayloadByte {
+                        payload_id,
+                        addr_lo: p.addr,
+                        content_preview: p.content[..preview_len].to_vec(),
+                        content_len,
+                        source_hint: p.source_hint,
+                    };
+                    let tag = table.intern(payload_origin);
+                    // Payloads get priority over any const-mem range they
+                    // overlap (add_mem_range does the overwrite for us).
+                    let hi = p.addr.saturating_add(content_len as u64);
+                    table.add_mem_range(p.addr, hi, tag);
+                }
+            }
+        }
+
+        table
+    }
+}
+
+/// Parsed form of one ExternalCall line's raw text.
+struct ExternalCallInfo {
+    callee: String,
+    args_preview: String,
+    ret_val: Option<u64>,
+    payloads: Vec<PayloadRef>,
+}
+
+struct PayloadRef {
+    addr: u64,
+    content: Vec<u8>,
+    source_hint: String,
+}
+
+/// Parse `" -> libc.so!free(0x77...=\"...\") ret: 0x...\n"`.
+///
+/// Input `slice` starts at the ExternalCall line's `file_offset` and may
+/// include trailing newlines or even the body of the payload string if it
+/// spans multiple physical lines. Returns `None` if the shape doesn't match.
+fn parse_external_call(slice: &[u8]) -> Option<ExternalCallInfo> {
+    // Locate "-> ".
+    let arrow = memmem::find(slice, b"-> ")?;
+    let after_arrow = &slice[arrow + 3..];
+
+    // callee = up to '(' (bytes before first '(' that is NOT inside quotes).
+    let lp = memchr(b'(', after_arrow)?;
+    let callee = String::from_utf8_lossy(&after_arrow[..lp]).trim().to_string();
+
+    // Walk from '(' forward, tracking quotes so we can find the matching ')'.
+    let args_start = lp + 1;
+    let mut i = args_start;
+    let mut in_quote = false;
+    // Track all `0xADDR="..."` payloads we encounter on the way.
+    let mut payloads: Vec<PayloadRef> = Vec::new();
+    let mut paren_close: Option<usize> = None;
+
+    while i < after_arrow.len() {
+        let c = after_arrow[i];
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && c == b')' {
+            paren_close = Some(i);
+            break;
+        }
+        // Inside the arg section (in or out of quote), look for
+        // `0xHEX="` payload anchors. We only look when we're NOT
+        // currently inside a quote — the anchor itself sits in the
+        // unquoted region before its own `"`.
+        if !in_quote
+            && c == b'0'
+            && i + 1 < after_arrow.len()
+            && (after_arrow[i + 1] == b'x' || after_arrow[i + 1] == b'X')
+        {
+            // Walk the hex digits.
+            let hex_start = i + 2;
+            let mut k = hex_start;
+            while k < after_arrow.len() && after_arrow[k].is_ascii_hexdigit() {
+                k += 1;
+            }
+            if k > hex_start
+                && k + 1 < after_arrow.len()
+                && after_arrow[k] == b'='
+                && after_arrow[k + 1] == b'"'
+            {
+                let addr = parse_hex_safe(&after_arrow[hex_start..k]);
+                let content_start = k + 2;
+                // Payload content ends at the next `"` (we'll flip
+                // in_quote on the opening `"` just after we skip
+                // forward to `content_start`, so this inner scan uses
+                // its own index).
+                let mut c_end = content_start;
+                while c_end < after_arrow.len() && after_arrow[c_end] != b'"' {
+                    c_end += 1;
+                }
+                if c_end < after_arrow.len() {
+                    let content = after_arrow[content_start..c_end].to_vec();
+                    payloads.push(PayloadRef {
+                        addr,
+                        content,
+                        source_hint: detect_payload_hint(&callee),
+                    });
+                    // Advance past the closing `"` and continue scanning.
+                    i = c_end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let paren_close = paren_close?;
+    let args_slice = &after_arrow[args_start..paren_close];
+    let args_preview = preview_args(args_slice);
+
+    // ret: 0xHEX  (optional)
+    let mut ret_val = None;
+    let after_paren = &after_arrow[paren_close + 1..];
+    if let Some(ret_pos) = memmem::find(after_paren, b"ret:") {
+        let mut k = ret_pos + 4;
+        while k < after_paren.len() && (after_paren[k] == b' ' || after_paren[k] == b'\t') {
+            k += 1;
+        }
+        if k + 1 < after_paren.len() && after_paren[k] == b'0' && after_paren[k + 1] == b'x' {
+            k += 2;
+            let vs = k;
+            while k < after_paren.len() && after_paren[k].is_ascii_hexdigit() {
+                k += 1;
+            }
+            if k > vs {
+                ret_val = Some(parse_hex_safe(&after_paren[vs..k]));
+            }
+        }
+    }
+
+    Some(ExternalCallInfo {
+        callee,
+        args_preview,
+        ret_val,
+        payloads,
+    })
+}
+
+/// Keep the args readable: collapse newlines + whitespace runs, truncate.
+fn preview_args(bytes: &[u8]) -> String {
+    const MAX: usize = 80;
+    let mut out = String::with_capacity(MAX);
+    let mut last_was_space = false;
+    for &b in bytes {
+        let c = match b {
+            b'\n' | b'\r' | b'\t' => b' ',
+            _ => b,
+        };
+        if c == b' ' {
+            if last_was_space {
+                continue;
+            }
+            last_was_space = true;
+        } else {
+            last_was_space = false;
+        }
+        out.push(c as char);
+        if out.len() >= MAX {
+            out.push('…');
+            return out;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn detect_payload_hint(callee: &str) -> String {
+    if callee.contains("NewStringUTF") {
+        "NewStringUTF arg".to_string()
+    } else if callee.contains("GetStringUTFChars") {
+        "GetStringUTFChars result".to_string()
+    } else if callee.ends_with("!free") || callee.ends_with("::free") {
+        "free arg".to_string()
+    } else {
+        format!("{} arg", callee)
+    }
 }
 
 /// Read the original raw text of an instruction line out of a backing byte
@@ -709,18 +1002,24 @@ fn parse_reg_val_in(section: &[u8], target_reg: crate::reg::RegId) -> Option<u64
 
 /// Extract register operands from a `[...]` memory operand segment.
 /// Returns the base register (first register found) or `REG_INVALID` if none.
+///
+/// Only `[` and `,` start a new token; internal whitespace does NOT — the
+/// old per-char trigger would double-push on formats like `[x27, x8]`
+/// because both `,` and the following space each triggered a fresh
+/// extract_token on "x8".
 fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) -> RegId {
     let mut base = REG_INVALID;
     let mut tok = [0u8; 8];
-    for j in 0..segment.len() {
+    let mut j = 0usize;
+    while j < segment.len() {
         let c = segment[j];
-        if c == b'[' || c == b',' || c == b' ' {
-            let mut k = j + 1;
-            while k < segment.len() && segment[k] == b' ' {
-                k += 1;
+        if c == b'[' || c == b',' {
+            j += 1;
+            while j < segment.len() && (segment[j] == b' ' || segment[j] == b'\t') {
+                j += 1;
             }
-            if k < segment.len() && segment[k] != b'#' && segment[k] != b']' {
-                let n = extract_token(&segment[k..], &mut tok);
+            if j < segment.len() && segment[j] != b'#' && segment[j] != b']' {
+                let n = extract_token(&segment[j..], &mut tok);
                 let rid = parse_reg_name(&tok[..n]);
                 if rid != REG_INVALID && (out.num_src as usize) < 8 {
                     if base == REG_INVALID {
@@ -729,7 +1028,12 @@ fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) -> RegId {
                     out.src_regs[out.num_src as usize] = rid;
                     out.num_src += 1;
                 }
+                j += n.max(1);
             }
+            // If segment[j] is '#' or ']' or end, fall through — outer
+            // while will advance past them.
+        } else {
+            j += 1;
         }
     }
     base

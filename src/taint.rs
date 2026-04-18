@@ -434,11 +434,29 @@ fn run_job(job: JobConfig) {
         parser.lines()[start_index].line_number
     )));
 
+    // Build the semantic tag table once the trace is parsed. This is a
+    // linear pass over `lines` + ExternalCall re-parse; for a ~7M-line
+    // window it's well under a second. Attaching it lets every
+    // ResultEntry and the boundary report spell out "this taint came
+    // from libc.so!rand()" / "payload #3 at offset 42" / "rodata at
+    // 0x76ff3e09b8" instead of bare hex.
+    let _ = tx.send(TaintMessage::Status("构建语义标签表 ...".to_string()));
+    let tag_table = std::sync::Arc::new(parser.build_tag_table(bytes));
+
     let mut engine = TaintEngine::new();
     engine.set_mode(mode);
     engine.set_source(source);
     engine.set_max_scan_distance(scan_limit);
     engine.set_max_depth(max_depth);
+    // Address-source mode (the "向后追踪地址来源" menu) uses
+    // `skip_start_propagation=true`. For those sources, stop backward
+    // tracing at stack-spill boundaries so the result focuses on where
+    // the address was computed rather than drowning in unrelated values
+    // that happened to share the same sp-relative slot earlier.
+    if mode == TrackMode::Backward && source.skip_start_propagation {
+        engine.set_stop_at_sp_spill(true);
+    }
+    engine.set_tag_table(tag_table);
     engine.set_cancel_token(cancel.clone());
     engine.run_with_bytes(parser.lines(), start_index, bytes);
 

@@ -12,7 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::parser::read_raw_line;
-use crate::reg::{normalize, reg_name, RegId, REG_INVALID, REG_LR, REG_NZCV, REG_Q0, REG_XZR};
+use crate::reg::{
+    normalize, reg_name, RegId, REG_FP, REG_INVALID, REG_LR, REG_NZCV, REG_Q0, REG_SP, REG_X0,
+    REG_XZR,
+};
+use crate::tag::{merge_tags, TagId, TagTable, TAG_UNTAGGED};
 use crate::trace::{InsnCategory, TraceLine};
 
 const NO_DEF: u32 = u32::MAX;
@@ -58,6 +62,14 @@ pub struct ResultEntry {
     pub index: usize,
     pub reg_snapshot: [bool; 256],
     pub mem_snapshot: Vec<u64>,
+    /// Phase 1 semantic tags aligned with `reg_snapshot` — index `i` is
+    /// the tag for register `i` when `reg_snapshot[i]` is true.
+    /// `TAG_UNTAGGED` when there is no specific origin.
+    pub reg_tags: [TagId; 256],
+    /// Phase 1 semantic tags aligned with `mem_snapshot` by address.
+    /// Every entry in `mem_snapshot` may have a corresponding
+    /// `(addr, tag)` here; absence means `TAG_UNTAGGED`.
+    pub mem_tags: Vec<(u64, TagId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +84,12 @@ pub struct ValueMismatch {
 pub struct RemainingTaint {
     pub regs: Vec<String>,
     pub mems: Vec<u64>,
+    /// Phase 1: per-register semantic tag paralleling `regs`. Empty Vec
+    /// means no tag lookup was available. Each entry is
+    /// `(reg_name, TagId)`; `TAG_UNTAGGED` when unknown.
+    pub reg_tags: Vec<(String, TagId)>,
+    /// Phase 1: per-address semantic tag paralleling `mems`.
+    pub mem_tags: Vec<(u64, TagId)>,
 }
 
 // ────────────────── labeled dep-graph (backward) ──────────────────
@@ -239,6 +257,20 @@ fn writeback_dst_idx(line: &TraceLine) -> Option<usize> {
     }
 }
 
+/// Whether `line`'s memory operand is based on SP or FP (x29).
+/// Used to recognise stack-spill memory so address-source backward
+/// tracing can stop at spill boundaries instead of chasing unrelated
+/// values written to the same stack slot by earlier code.
+#[inline]
+fn is_sp_rel_mem(line: &TraceLine) -> bool {
+    let base = line.mem_base_reg;
+    if base == REG_INVALID {
+        return false;
+    }
+    let n = normalize(base);
+    n == REG_SP || n == normalize(REG_FP)
+}
+
 /// Taint-guided backward traversal on the labeled dep graph.
 ///
 /// Instead of blindly expanding all deps (which explodes through
@@ -256,6 +288,7 @@ fn taint_guided_collect(
     is_dst: bool,
     max_depth: u32,
     max_nodes: usize,
+    stop_at_sp_spill: bool,
     cancel: &Option<Arc<AtomicBool>>,
 ) -> (Vec<usize>, bool) {
     let mut active_regs = [false; 256];
@@ -389,6 +422,14 @@ fn taint_guided_collect(
         }
         for &(addr, pred) in &d.mem_preds {
             if active_mem.contains_key(&addr) && !visited[pred as usize] {
+                // Address-source mode: don't chase writers of SP/FP-relative
+                // slots — those are stack spills and the value inside is
+                // unrelated to the register we're tracing through them.
+                // Leaving the address in active_mem means it surfaces as a
+                // boundary taint, which is the right UX signal.
+                if stop_at_sp_spill && is_sp_rel_mem(&lines[pred as usize]) {
+                    continue;
+                }
                 queue.push_back((pred, depth + 1));
             }
         }
@@ -407,6 +448,7 @@ fn rebuild_snapshots(
     lines: &[TraceLine],
     visited: &[usize],
     source: &TaintSource,
+    start_index: usize,
 ) -> (Vec<ResultEntry>, [bool; 256], FxHashMap<u64, ()>) {
     let mut active_regs = [false; 256];
     let mut active_mem: FxHashMap<u64, ()> = FxHashMap::default();
@@ -419,9 +461,141 @@ fn rebuild_snapshots(
 
     let mut entries: Vec<ResultEntry> = Vec::with_capacity(visited.len());
 
-    // Process in DESCENDING order (target → earliest)
+    // Process in DESCENDING order (target → earliest).
+    //
+    // Each row's snapshot is **row-scoped**: it shows this line's full
+    // taint contribution to the chain — both
+    //   • output side (dst / mem-write that downstream actually consumes), AND
+    //   • input side (src regs / mem-read that this line pulls in to
+    //     feed that dst, following the same category rules as
+    //     `taint_guided_collect`).
+    //
+    // This matches the user intent: "what does *this row* put into and
+    // take out of the taint chain". Showing only dst hides the
+    // register that flowed into it (e.g. `mov x8, x10` must show BOTH
+    // x8 and x10). Showing the engine's full active set bleeds
+    // unrelated regs into every row.
+    //
+    // The start line is special: the configured source is the user's
+    // answer to "this is the taint I'm tracing" — we don't append its
+    // line's src regs (those are what we're going to trace *to*).
     for &idx in visited.iter().rev() {
         let line = &lines[idx];
+
+        let mut row_regs = [false; 256];
+        let mut row_mems: Vec<u64> = Vec::new();
+
+        if idx == start_index {
+            // Start line: just the source, untainted src/mem_read of the
+            // start line itself is the boundary we're heading toward.
+            if source.is_mem {
+                row_mems.push(source.mem_addr);
+            } else {
+                let nid = normalize(source.reg) as usize;
+                if nid < 256 {
+                    row_regs[nid] = true;
+                }
+            }
+        } else {
+            // ── Output side: which dst / mem-write are in active? ──
+            let mut dst_active_mask: u32 = 0;
+            for j in 0..line.num_dst as usize {
+                let nid = normalize(line.dst_regs[j]) as usize;
+                if active_regs[nid] {
+                    dst_active_mask |= 1 << j;
+                    row_regs[nid] = true;
+                }
+            }
+            let nzcv_active = line.sets_flags && active_regs[REG_NZCV as usize];
+            if nzcv_active {
+                row_regs[REG_NZCV as usize] = true;
+            }
+            let mem_w_active = line.has_mem_write
+                && active_mem.contains_key(&line.mem_write_addr);
+            let mem_w2_active = line.has_mem_write2
+                && active_mem.contains_key(&line.mem_write_addr2);
+            if mem_w_active {
+                row_mems.push(line.mem_write_addr);
+            }
+            if mem_w2_active {
+                row_mems.push(line.mem_write_addr2);
+            }
+
+            // ── Input side: iff any output is live, mirror the category
+            //    rules from taint_guided_collect so the shown src regs /
+            //    mem-reads are exactly those that feed the live dsts. ──
+            let any_out = dst_active_mask != 0 || nzcv_active || mem_w_active || mem_w2_active;
+            if any_out {
+                let wb_idx = writeback_dst_idx(line);
+                match line.category {
+                    InsnCategory::ImmLoad | InsnCategory::ExternalCall => {
+                        // No input contribution shown: ImmLoad has no
+                        // src that carries upstream taint; ExternalCall
+                        // is a black box whose caller-saved upstream is
+                        // already clipped by the engine.
+                    }
+                    InsnCategory::Load => {
+                        // Data flow enters via mem_read, not the address
+                        // regs (GumTrace "只追数据流" design).
+                        let d0_data = (dst_active_mask & 1) != 0 && wb_idx != Some(0);
+                        let d1_data = (dst_active_mask & 2) != 0 && wb_idx != Some(1);
+                        if line.has_mem_read2 {
+                            if d0_data {
+                                row_mems.push(line.mem_read_addr);
+                            }
+                            if d1_data {
+                                row_mems.push(line.mem_read_addr2);
+                            }
+                        } else if d0_data && line.has_mem_read {
+                            row_mems.push(line.mem_read_addr);
+                        }
+                    }
+                    InsnCategory::Store => {
+                        if mem_w_active && line.num_src > 0 {
+                            row_regs[normalize(line.src_regs[0]) as usize] = true;
+                        }
+                        if mem_w2_active && line.num_src > 1 {
+                            row_regs[normalize(line.src_regs[1]) as usize] = true;
+                        }
+                    }
+                    InsnCategory::CondSelect => {
+                        for j in 0..line.num_src as usize {
+                            row_regs[normalize(line.src_regs[j]) as usize] = true;
+                        }
+                        // csel depends on NZCV.
+                        row_regs[REG_NZCV as usize] = true;
+                    }
+                    _ => {
+                        for j in 0..line.num_src as usize {
+                            row_regs[normalize(line.src_regs[j]) as usize] = true;
+                        }
+                        if line.has_mem_read {
+                            row_mems.push(line.mem_read_addr);
+                        }
+                    }
+                }
+            }
+        }
+
+        entries.push(ResultEntry {
+            index: idx,
+            reg_snapshot: row_regs,
+            mem_snapshot: row_mems,
+            // Backward/rebuild doesn't track per-register semantic tags
+            // directly yet — tags get resolved from the side-car TagTable
+            // at format time based on the mem addresses present in
+            // mem_snapshot. Phase 2 will add proper per-reg tag rebuild.
+            reg_tags: [TAG_UNTAGGED; 256],
+            mem_tags: Vec::new(),
+        });
+
+        // Address-source mode: the start line's src (not its dst) is the
+        // thing we're tracing. taint_guided_collect mirrors this by never
+        // running the match-arm propagation on the start index in that
+        // case; rebuild must match, otherwise it would e.g. clear the
+        // source reg and insert the start line's mem_read into active_mem
+        // — producing a bogus boundary taint from the start line itself.
+        let skip_propagate_start = source.skip_start_propagation && idx == start_index;
 
         let mut dst_active_mask: u32 = 0;
         for j in 0..line.num_dst as usize {
@@ -434,7 +608,7 @@ fn rebuild_snapshots(
         let mem_w_active = line.has_mem_write && active_mem.contains_key(&line.mem_write_addr);
         let mem_w2_active = line.has_mem_write2 && active_mem.contains_key(&line.mem_write_addr2);
 
-        if dst_active || nzcv_active || mem_w_active || mem_w2_active {
+        if !skip_propagate_start && (dst_active || nzcv_active || mem_w_active || mem_w2_active) {
             if dst_active {
                 for j in 0..line.num_dst as usize { active_regs[normalize(line.dst_regs[j]) as usize] = false; }
             }
@@ -478,12 +652,6 @@ fn rebuild_snapshots(
                 }
             }
         }
-
-        entries.push(ResultEntry {
-            index: idx,
-            reg_snapshot: active_regs,
-            mem_snapshot: active_mem.keys().copied().collect(),
-        });
     }
 
     entries.reverse();
@@ -497,17 +665,42 @@ pub struct TaintEngine {
     source: TaintSource,
     max_scan_distance: u32,
     max_depth: u32,
+    /// When true, backward tracing does not follow mem_preds whose writer
+    /// is SP/FP-relative (stack spills). The tracked register's value came
+    /// from whatever wrote the spill slot *in this dynamic instance*, but
+    /// going further through the slot almost always derails into
+    /// unrelated callers that happened to reuse the same slot earlier.
+    /// Set by the UI for the "向后追踪地址来源" menu path.
+    stop_at_sp_spill: bool,
     cancel: Option<Arc<AtomicBool>>,
 
+    /// Optional semantic-tag side table. When present, the engine
+    /// decorates boundary taint and every ResultEntry with human-
+    /// readable origin labels (external-call return values, const-mem
+    /// ranges, payload strings).
+    tag_table: Option<Arc<TagTable>>,
+    /// Explicit UserSeed tag attached to the configured `source` (if any).
+    source_tag: TagId,
+
     reg_taint: [bool; 256],
+    reg_tag: [TagId; 256],
     tainted_reg_count: i32,
-    tainted_mem: FxHashMap<u64, Option<u64>>,
+    tainted_mem: FxHashMap<u64, MemTaint>,
 
     results: Vec<ResultEntry>,
     mismatches: Vec<ValueMismatch>,
     stop_reason: StopReason,
     start_index: Option<usize>,
     remaining_taint_at_boundary: Option<RemainingTaint>,
+}
+
+/// Tainted-memory cell metadata.
+#[derive(Copy, Clone, Debug, Default)]
+struct MemTaint {
+    /// Original expected value (for value-sensitive mismatches).
+    expected_val: Option<u64>,
+    /// Semantic tag for Phase 1 origin reporting.
+    tag: TagId,
 }
 
 impl Default for TaintEngine {
@@ -521,8 +714,12 @@ impl TaintEngine {
             source: TaintSource::from_reg(REG_INVALID),
             max_scan_distance: 50_000,
             max_depth: DEFAULT_MAX_DEPTH,
+            stop_at_sp_spill: false,
             cancel: None,
+            tag_table: None,
+            source_tag: TAG_UNTAGGED,
             reg_taint: [false; 256],
+            reg_tag: [TAG_UNTAGGED; 256],
             tainted_reg_count: 0,
             tainted_mem: FxHashMap::default(),
             results: Vec::new(),
@@ -540,7 +737,29 @@ impl TaintEngine {
     pub fn set_mode(&mut self, mode: TrackMode) { self.mode = mode; }
     pub fn set_max_scan_distance(&mut self, n: u32) { self.max_scan_distance = n; }
     pub fn set_max_depth(&mut self, n: u32) { self.max_depth = n; }
+    pub fn set_stop_at_sp_spill(&mut self, b: bool) { self.stop_at_sp_spill = b; }
     pub fn set_cancel_token(&mut self, token: Arc<AtomicBool>) { self.cancel = Some(token); }
+
+    /// Attach a semantic-origin table. Once set, every subsequent `run`
+    /// / `run_with_bytes` call decorates the returned `ResultEntry`s and
+    /// boundary report with human-readable tags.
+    pub fn set_tag_table(&mut self, table: Arc<TagTable>) { self.tag_table = Some(table); }
+    pub fn tag_table(&self) -> Option<&TagTable> { self.tag_table.as_deref() }
+    pub fn source_tag(&self) -> TagId { self.source_tag }
+
+    /// Explicitly tag the configured source (e.g. with a `UserSeed`).
+    /// Must be called *after* `set_source`.
+    pub fn set_source_tag(&mut self, tag: TagId) {
+        self.source_tag = tag;
+        if !self.source.is_mem {
+            let nid = normalize(self.source.reg) as usize;
+            if self.reg_taint[nid] {
+                self.reg_tag[nid] = tag;
+            }
+        } else if let Some(cell) = self.tainted_mem.get_mut(&self.source.mem_addr) {
+            cell.tag = tag;
+        }
+    }
     pub fn stop_reason(&self) -> StopReason { self.stop_reason }
     pub fn results(&self) -> &[ResultEntry] { &self.results }
     pub fn into_results(self) -> Vec<ResultEntry> { self.results }
@@ -557,8 +776,11 @@ impl TaintEngine {
         self.mismatches.clear();
         self.stop_reason = StopReason::EndOfTrace;
 
+        self.source_tag = TAG_UNTAGGED;
+        self.reg_tag = [TAG_UNTAGGED; 256];
         if source.is_mem {
-            self.tainted_mem.insert(source.mem_addr, None);
+            self.tainted_mem
+                .insert(source.mem_addr, MemTaint::default());
         } else {
             self.taint_reg(source.reg);
         }
@@ -568,16 +790,98 @@ impl TaintEngine {
 
     #[inline]
     fn taint_reg(&mut self, id: RegId) {
-        if id == REG_INVALID || id == REG_XZR { return; }
+        self.taint_reg_with_tag(id, TAG_UNTAGGED);
+    }
+
+    #[inline]
+    fn taint_reg_with_tag(&mut self, id: RegId, tag: TagId) {
+        if id == REG_INVALID || id == REG_XZR {
+            return;
+        }
         let nid = normalize(id) as usize;
-        if !self.reg_taint[nid] { self.reg_taint[nid] = true; self.tainted_reg_count += 1; }
+        if !self.reg_taint[nid] {
+            self.reg_taint[nid] = true;
+            self.tainted_reg_count += 1;
+            self.reg_tag[nid] = tag;
+        } else {
+            self.reg_tag[nid] = self.merge_tag(self.reg_tag[nid], tag);
+        }
     }
 
     #[inline]
     fn untaint_reg(&mut self, id: RegId) {
-        if id == REG_INVALID || id == REG_XZR { return; }
+        if id == REG_INVALID || id == REG_XZR {
+            return;
+        }
         let nid = normalize(id) as usize;
-        if self.reg_taint[nid] { self.reg_taint[nid] = false; self.tainted_reg_count -= 1; }
+        if self.reg_taint[nid] {
+            self.reg_taint[nid] = false;
+            self.tainted_reg_count -= 1;
+            self.reg_tag[nid] = TAG_UNTAGGED;
+        }
+    }
+
+    #[inline]
+    fn taint_mem(&mut self, addr: u64, val: u64, tag: TagId) {
+        let slot = self.tainted_mem.entry(addr).or_default();
+        slot.expected_val = Some(val);
+        // Merge the new tag with whatever was already labelling this cell.
+        if let Some(table) = &self.tag_table {
+            slot.tag = merge_tags(table, slot.tag, tag);
+        } else if slot.tag == TAG_UNTAGGED {
+            slot.tag = tag;
+        }
+    }
+
+    #[inline]
+    fn untaint_mem(&mut self, addr: u64) {
+        self.tainted_mem.remove(&addr);
+    }
+
+    #[inline]
+    fn merge_tag(&self, a: TagId, b: TagId) -> TagId {
+        match &self.tag_table {
+            Some(table) => merge_tags(table, a, b),
+            None => {
+                if a == TAG_UNTAGGED {
+                    b
+                } else {
+                    a
+                }
+            }
+        }
+    }
+
+    /// Summarise the "is any src tainted, and if so with which tag"
+    /// for the given line. Used by propagate arms that need to carry
+    /// the upstream tag forward into their dsts.
+    fn src_taint_with_tag(&self, line: &TraceLine) -> (bool, TagId) {
+        let mut tainted = false;
+        let mut tag = TAG_UNTAGGED;
+        for i in 0..line.num_src as usize {
+            let id = line.src_regs[i];
+            if id == REG_INVALID || id == REG_XZR {
+                continue;
+            }
+            let nid = normalize(id) as usize;
+            if self.reg_taint[nid] {
+                tainted = true;
+                tag = self.merge_tag(tag, self.reg_tag[nid]);
+            }
+        }
+        if line.has_mem_read {
+            if let Some(mt) = self.tainted_mem.get(&line.mem_read_addr) {
+                tainted = true;
+                tag = self.merge_tag(tag, mt.tag);
+            }
+        }
+        if line.has_mem_read2 {
+            if let Some(mt) = self.tainted_mem.get(&line.mem_read_addr2) {
+                tainted = true;
+                tag = self.merge_tag(tag, mt.tag);
+            }
+        }
+        (tainted, tag)
     }
 
     #[inline]
@@ -611,17 +915,33 @@ impl TaintEngine {
     }
 
     fn record(&mut self, index: usize) {
+        let mem_snapshot: Vec<u64> = self.tainted_mem.keys().copied().collect();
+        let mem_tags: Vec<(u64, TagId)> = self
+            .tainted_mem
+            .iter()
+            .map(|(&addr, mt)| (addr, mt.tag))
+            .collect();
         self.results.push(ResultEntry {
-            index, reg_snapshot: self.reg_taint,
-            mem_snapshot: self.tainted_mem.keys().copied().collect(),
+            index,
+            reg_snapshot: self.reg_taint,
+            mem_snapshot,
+            reg_tags: self.reg_tag,
+            mem_tags,
         });
     }
 
     fn check_mem_read_mismatch(&mut self, addr: u64, actual_val: u64, index: usize) {
-        if let Some(&Some(expected)) = self.tainted_mem.get(&addr) {
+        if let Some(&MemTaint {
+            expected_val: Some(expected),
+            ..
+        }) = self.tainted_mem.get(&addr)
+        {
             if expected != actual_val {
                 self.mismatches.push(ValueMismatch {
-                    index, mem_addr: addr, expected_val: expected, actual_val,
+                    index,
+                    mem_addr: addr,
+                    expected_val: expected,
+                    actual_val,
                 });
             }
         }
@@ -631,79 +951,169 @@ impl TaintEngine {
         use InsnCategory::*;
         match line.category {
             ImmLoad => {
-                for i in 0..line.num_dst as usize { self.untaint_reg(line.dst_regs[i]); }
+                for i in 0..line.num_dst as usize {
+                    self.untaint_reg(line.dst_regs[i]);
+                }
             }
-            ExternalCall => { self.untaint_caller_saved(); }
+            ExternalCall => {
+                // AAPCS64: caller-saved regs clobbered by the call. Anything
+                // the caller had tainted in them is *consumed* by the callee.
+                // If we had upstream taint going in, the callee's return
+                // value is — from our perspective — tainted by that upstream
+                // data too (the callee is a black box but its output must
+                // depend on its input). We model this by re-tainting x0
+                // with the ExternalCall's semantic tag so the downstream
+                // taint chain still flows, just labelled.
+                let upstream = self.any_caller_saved_tainted();
+                let (_, upstream_tag) = self.src_taint_with_tag(line);
+                self.untaint_caller_saved();
+                if upstream {
+                    let ext_tag = self
+                        .tag_table
+                        .as_ref()
+                        .and_then(|t| t.tag_for_ext_call(index as u32))
+                        .unwrap_or(TAG_UNTAGGED);
+                    let merged = self.merge_tag(upstream_tag, ext_tag);
+                    self.taint_reg_with_tag(REG_X0, merged);
+                }
+            }
             PartialModify => {}
             DataMove | Arithmetic | Logic | ShiftExt | Bitfield => {
-                let src_t = self.any_src_tainted(line);
+                let (src_t, src_tag) = self.src_taint_with_tag(line);
                 for i in 0..line.num_dst as usize {
-                    if src_t { self.taint_reg(line.dst_regs[i]); }
-                    else { self.untaint_reg(line.dst_regs[i]); }
+                    if src_t {
+                        self.taint_reg_with_tag(line.dst_regs[i], src_tag);
+                    } else {
+                        self.untaint_reg(line.dst_regs[i]);
+                    }
                 }
                 if line.sets_flags {
-                    if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
+                    if src_t {
+                        self.taint_reg_with_tag(REG_NZCV, src_tag);
+                    } else {
+                        self.untaint_reg(REG_NZCV);
+                    }
                 }
             }
             CondSelect => {
                 // csel/csinc/... depends on the chosen srcs AND NZCV.
-                let src_t = self.any_src_tainted(line) || self.is_reg_tainted(REG_NZCV);
+                let (src_t_data, src_tag_data) = self.src_taint_with_tag(line);
+                let nzcv_t = self.is_reg_tainted(REG_NZCV);
+                let src_t = src_t_data || nzcv_t;
+                let src_tag = if nzcv_t {
+                    self.merge_tag(src_tag_data, self.reg_tag[REG_NZCV as usize])
+                } else {
+                    src_tag_data
+                };
                 for i in 0..line.num_dst as usize {
-                    if src_t { self.taint_reg(line.dst_regs[i]); }
-                    else { self.untaint_reg(line.dst_regs[i]); }
+                    if src_t {
+                        self.taint_reg_with_tag(line.dst_regs[i], src_tag);
+                    } else {
+                        self.untaint_reg(line.dst_regs[i]);
+                    }
                 }
                 if line.sets_flags {
-                    if src_t { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
+                    if src_t {
+                        self.taint_reg_with_tag(REG_NZCV, src_tag);
+                    } else {
+                        self.untaint_reg(REG_NZCV);
+                    }
                 }
             }
             Load => {
                 let wb_idx = writeback_dst_idx(line);
                 if line.has_mem_read2 && line.num_dst >= 2 {
-                    // LDP data pair: dst[0]↔read_addr, dst[1]↔read_addr2.
-                    // Writeback base (if any) is dst[last], skipped here so
-                    // its taint carries over unchanged from the old base.
-                    let mt1 = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
-                    let mt2 = self.tainted_mem.contains_key(&line.mem_read_addr2);
-                    if mt1 { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); self.taint_reg(line.dst_regs[0]); }
-                    else { self.untaint_reg(line.dst_regs[0]); }
-                    if mt2 { self.check_mem_read_mismatch(line.mem_read_addr2, line.mem_read_val2, index); self.taint_reg(line.dst_regs[1]); }
-                    else { self.untaint_reg(line.dst_regs[1]); }
+                    let mt1_slot = line.has_mem_read
+                        .then(|| self.tainted_mem.get(&line.mem_read_addr).copied())
+                        .flatten();
+                    let mt2_slot = self.tainted_mem.get(&line.mem_read_addr2).copied();
+                    if let Some(s) = mt1_slot {
+                        self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
+                        self.taint_reg_with_tag(line.dst_regs[0], s.tag);
+                    } else {
+                        self.untaint_reg(line.dst_regs[0]);
+                    }
+                    if let Some(s) = mt2_slot {
+                        self.check_mem_read_mismatch(line.mem_read_addr2, line.mem_read_val2, index);
+                        self.taint_reg_with_tag(line.dst_regs[1], s.tag);
+                    } else {
+                        self.untaint_reg(line.dst_regs[1]);
+                    }
                 } else {
-                    let mt = line.has_mem_read && self.tainted_mem.contains_key(&line.mem_read_addr);
-                    if mt { self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index); }
+                    let mt_slot = line.has_mem_read
+                        .then(|| self.tainted_mem.get(&line.mem_read_addr).copied())
+                        .flatten();
+                    if mt_slot.is_some() {
+                        self.check_mem_read_mismatch(line.mem_read_addr, line.mem_read_val, index);
+                    }
                     for i in 0..line.num_dst as usize {
-                        if wb_idx == Some(i) { continue; } // keep writeback base's taint
-                        if mt { self.taint_reg(line.dst_regs[i]); } else { self.untaint_reg(line.dst_regs[i]); }
+                        if wb_idx == Some(i) {
+                            continue; // keep writeback base's taint
+                        }
+                        if let Some(s) = mt_slot {
+                            self.taint_reg_with_tag(line.dst_regs[i], s.tag);
+                        } else {
+                            self.untaint_reg(line.dst_regs[i]);
+                        }
                     }
                 }
             }
             Store => {
                 if line.has_mem_write {
                     if line.has_mem_write2 && line.num_src >= 2 {
-                        if self.is_reg_tainted(line.src_regs[0]) { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
-                        else { self.tainted_mem.remove(&line.mem_write_addr); }
-                        if self.is_reg_tainted(line.src_regs[1]) { self.tainted_mem.insert(line.mem_write_addr2, Some(line.mem_write_val2)); }
-                        else { self.tainted_mem.remove(&line.mem_write_addr2); }
+                        let s0 = line.src_regs[0];
+                        let s1 = line.src_regs[1];
+                        if self.is_reg_tainted(s0) {
+                            let tag = self.reg_tag[normalize(s0) as usize];
+                            self.taint_mem(line.mem_write_addr, line.mem_write_val, tag);
+                        } else {
+                            self.untaint_mem(line.mem_write_addr);
+                        }
+                        if self.is_reg_tainted(s1) {
+                            let tag = self.reg_tag[normalize(s1) as usize];
+                            self.taint_mem(line.mem_write_addr2, line.mem_write_val2, tag);
+                        } else {
+                            self.untaint_mem(line.mem_write_addr2);
+                        }
                     } else {
-                        let st = line.num_src > 0 && self.is_reg_tainted(line.src_regs[0]);
-                        if st { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
-                        else { self.tainted_mem.remove(&line.mem_write_addr); }
+                        let s0 = if line.num_src > 0 {
+                            line.src_regs[0]
+                        } else {
+                            REG_INVALID
+                        };
+                        if line.num_src > 0 && self.is_reg_tainted(s0) {
+                            let tag = self.reg_tag[normalize(s0) as usize];
+                            self.taint_mem(line.mem_write_addr, line.mem_write_val, tag);
+                        } else {
+                            self.untaint_mem(line.mem_write_addr);
+                        }
                     }
                 }
             }
             Compare => {
-                let st = self.any_src_tainted(line);
-                if st { self.taint_reg(REG_NZCV); } else { self.untaint_reg(REG_NZCV); }
+                let (st, tag) = self.src_taint_with_tag(line);
+                if st {
+                    self.taint_reg_with_tag(REG_NZCV, tag);
+                } else {
+                    self.untaint_reg(REG_NZCV);
+                }
             }
             Branch => {}
             Other => {
-                let st = self.any_src_tainted(line);
+                let (st, tag) = self.src_taint_with_tag(line);
                 for i in 0..line.num_dst as usize {
-                    if st { self.taint_reg(line.dst_regs[i]); } else { self.untaint_reg(line.dst_regs[i]); }
+                    if st {
+                        self.taint_reg_with_tag(line.dst_regs[i], tag);
+                    } else {
+                        self.untaint_reg(line.dst_regs[i]);
+                    }
                 }
                 if line.has_mem_write {
-                    if st { self.tainted_mem.insert(line.mem_write_addr, Some(line.mem_write_val)); }
-                    else { self.tainted_mem.remove(&line.mem_write_addr); }
+                    if st {
+                        self.taint_mem(line.mem_write_addr, line.mem_write_val, tag);
+                    } else {
+                        self.untaint_mem(line.mem_write_addr);
+                    }
                 }
             }
         }
@@ -711,6 +1121,19 @@ impl TaintEngine {
 
     fn is_cancelled(&self) -> bool {
         self.cancel.as_ref().map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+    }
+
+    /// Resolve a `TagId` into the short human-readable label via the
+    /// installed tag table. Returns `None` when the tag is untagged or no
+    /// tag table is present.
+    fn tag_label(&self, tag: TagId) -> Option<String> {
+        if !tag.is_tagged() {
+            return None;
+        }
+        self.tag_table
+            .as_ref()
+            .and_then(|t| t.origin(tag))
+            .map(|o| o.short_label())
     }
 
     // ───────── main entry points ─────────
@@ -781,7 +1204,8 @@ impl TaintEngine {
                 let max_nodes = self.max_scan_distance as usize;
                 let (visited, truncated) = taint_guided_collect(
                     lines, &deps, start_index, &self.source,
-                    is_dst, self.max_depth, max_nodes, &self.cancel,
+                    is_dst, self.max_depth, max_nodes,
+                    self.stop_at_sp_spill, &self.cancel,
                 );
 
                 if self.is_cancelled() { self.stop_reason = StopReason::Cancelled; return; }
@@ -792,7 +1216,7 @@ impl TaintEngine {
 
                 // Phase 2b: rebuild snapshots in correct sequential order
                 let (entries, remaining_regs, remaining_mem) =
-                    rebuild_snapshots(lines, &visited, &self.source);
+                    rebuild_snapshots(lines, &visited, &self.source, start_index);
                 self.results = entries;
 
                 // Build boundary taint
@@ -804,9 +1228,25 @@ impl TaintEngine {
                 }
                 let mut mems: Vec<u64> = remaining_mem.keys().copied().collect();
                 mems.sort_unstable();
+                // Resolve mem → TagId via the optional tag table so the
+                // boundary report can call out known const / payload
+                // regions by name.
+                let mem_tags: Vec<(u64, TagId)> = if let Some(table) = &self.tag_table {
+                    mems.iter()
+                        .map(|&a| (a, table.tag_for_mem(a).unwrap_or(TAG_UNTAGGED)))
+                        .collect()
+                } else {
+                    mems.iter().map(|&a| (a, TAG_UNTAGGED)).collect()
+                };
+                let reg_tags: Vec<(String, TagId)> =
+                    regs.iter().map(|r| (r.clone(), TAG_UNTAGGED)).collect();
                 if !regs.is_empty() || !mems.is_empty() {
-                    self.remaining_taint_at_boundary =
-                        Some(RemainingTaint { regs, mems });
+                    self.remaining_taint_at_boundary = Some(RemainingTaint {
+                        regs,
+                        mems,
+                        reg_tags,
+                        mem_tags,
+                    });
                 }
             }
         }
@@ -838,11 +1278,55 @@ impl TaintEngine {
 
         if let Some(ref remaining) = self.remaining_taint_at_boundary {
             out.push_str("⚠ 以下 taint 在到达 trace 边界时仍未清除:\n");
-            out.push_str(&format!("  寄存器: {}\n",
-                if remaining.regs.is_empty() { "(无)".to_string() } else { remaining.regs.join(", ") }));
+            // Registers, annotated with their tag if any.
+            if remaining.regs.is_empty() {
+                out.push_str("  寄存器: (无)\n");
+            } else {
+                out.push_str("  寄存器: ");
+                for (i, (r, tag)) in remaining.reg_tags.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(r);
+                    if let Some(label) = self.tag_label(*tag) {
+                        out.push_str(&format!(" [{}]", label));
+                    }
+                }
+                out.push('\n');
+            }
             if !remaining.mems.is_empty() {
-                let mems: Vec<String> = remaining.mems.iter().map(|a| format!("0x{:x}", a)).collect();
-                out.push_str(&format!("  内存: {}\n", mems.join(", ")));
+                out.push_str("  内存: ");
+                for (i, (a, tag)) in remaining.mem_tags.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&format!("0x{:x}", a));
+                    if let Some(label) = self.tag_label(*tag) {
+                        out.push_str(&format!(" [{}]", label));
+                    }
+                }
+                out.push('\n');
+            }
+            // If we have a tag table, list the unique origins touched in
+            // this boundary report so the user has a "真正来源" summary.
+            if let Some(table) = &self.tag_table {
+                let mut tags: Vec<TagId> = remaining
+                    .mem_tags
+                    .iter()
+                    .map(|&(_, t)| t)
+                    .chain(remaining.reg_tags.iter().map(|(_, t)| *t))
+                    .filter(|t| t.is_tagged())
+                    .collect();
+                tags.sort_by_key(|t| t.0);
+                tags.dedup();
+                if !tags.is_empty() {
+                    out.push_str("  已知来源:\n");
+                    for t in tags {
+                        if let Some(o) = table.origin(t) {
+                            out.push_str(&format!("    - {}\n", o.long_label()));
+                        }
+                    }
+                }
             }
             if !lines.is_empty() {
                 let first_line = read_raw_line(bytes, &lines[0]);
@@ -876,12 +1360,34 @@ impl TaintEngine {
                 if entry.reg_snapshot[i as usize] {
                     if !first { out.push_str(", "); }
                     out.push_str(reg_name(i as u8));
+                    let tag = entry.reg_tags[i as usize];
+                    if let Some(label) = self.tag_label(tag) {
+                        out.push_str(&format!("[{}]", label));
+                    }
                     first = false;
                 }
             }
             for m in &entry.mem_snapshot {
                 if !first { out.push_str(", "); }
                 out.push_str(&format!("mem:0x{:x}", m));
+                // Resolve tag preferentially from the entry's per-mem tag
+                // list; fall back to the tag table for ConstMem / payload.
+                let tag = entry
+                    .mem_tags
+                    .iter()
+                    .find_map(|&(a, t)| if a == *m { Some(t) } else { None })
+                    .unwrap_or(TAG_UNTAGGED);
+                let tag = if tag.is_tagged() {
+                    tag
+                } else {
+                    self.tag_table
+                        .as_ref()
+                        .and_then(|t| t.tag_for_mem(*m))
+                        .unwrap_or(TAG_UNTAGGED)
+                };
+                if let Some(label) = self.tag_label(tag) {
+                    out.push_str(&format!("[{}]", label));
+                }
                 first = false;
             }
             out.push_str("}\n\n");
