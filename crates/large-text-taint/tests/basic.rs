@@ -1,4 +1,4 @@
-use large_text_taint::engine::{StopReason, TaintEngine, TaintSource, TrackMode};
+use large_text_taint::engine::{MemRange, StopReason, TaintEngine, TaintSource, TrackMode};
 use large_text_taint::parser::TraceParser;
 use large_text_taint::reg::parse_reg_name;
 use large_text_taint::trace::InsnCategory;
@@ -66,6 +66,118 @@ fn classify_handles_branch_with_dot() {
 }
 
 #[test]
+fn parses_current_xgtrace_register_display_format() {
+    let fixture = "\
+libtiny.so!178e08 0x7ac2d9ae08: \"\tmov\tw9, #0x5f30\" => X9=0x5f30
+libtiny.so!178e0c 0x7ac2d9ae0c: \"\tadd\tx10, x10, w11, sxtw\" X10=0x7ac6aee6a8, X11=0xfc2c8270 => X10=0x7ac2db6918
+libtiny.so!178df8 0x7ac2d9adf8: \"\tmrs\tx8, TPIDR_EL0\" => X8=0x7b70e35000
+libtiny.so!543644 0x7ac3165644: \"\tushr\tv1.2s, v0.2s, #0x11\" Q0=0x80000000 => Q1=0x4000
+libtiny.so!543630 0x7ac3165630: \"\tldur\td0, [x20, #-0x8]\" X20=0x7b70e25850 => Q0=0x0
+MEM R 0x7b70e25848 [8 bytes]: 00 00 00 00 00 00 00 00  ........
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(fixture.as_bytes());
+    let lines = p.lines();
+    assert_eq!(lines.len(), 5);
+
+    let mov_w = &lines[0];
+    assert_eq!(mov_w.dst_regs[0], parse_reg_name(b"x9"));
+    assert_eq!(mov_w.num_src, 0);
+
+    let add_sxtw = &lines[1];
+    assert_eq!(add_sxtw.dst_regs[0], parse_reg_name(b"x10"));
+    assert_eq!(add_sxtw.src_regs[0], parse_reg_name(b"x10"));
+    assert_eq!(add_sxtw.src_regs[1], parse_reg_name(b"x11"));
+
+    let mrs = &lines[2];
+    assert_eq!(mrs.dst_regs[0], parse_reg_name(b"x8"));
+    assert_eq!(mrs.num_src, 0);
+
+    let ushr = &lines[3];
+    assert_eq!(ushr.dst_regs[0], parse_reg_name(b"q1"));
+    assert_eq!(ushr.src_regs[0], parse_reg_name(b"q0"));
+
+    let ldur_d = &lines[4];
+    assert_eq!(
+        large_text_taint::reg::normalize(ldur_d.dst_regs[0]),
+        parse_reg_name(b"q0")
+    );
+    assert_eq!(ldur_d.src_regs[0], parse_reg_name(b"x20"));
+    assert!(ldur_d.has_mem_read);
+}
+
+#[test]
+fn parse_register_aliases_used_by_xgtrace_ui() {
+    assert_eq!(parse_reg_name(b"FLAGS"), parse_reg_name(b"nzcv"));
+    assert_eq!(parse_reg_name(b"NZCV"), parse_reg_name(b"nzcv"));
+    assert_eq!(parse_reg_name(b"SP"), parse_reg_name(b"sp"));
+    assert_eq!(parse_reg_name(b"LR"), parse_reg_name(b"lr"));
+    assert_eq!(
+        large_text_taint::reg::normalize(parse_reg_name(b"D0")),
+        parse_reg_name(b"q0")
+    );
+    assert_eq!(
+        large_text_taint::reg::normalize(parse_reg_name(b"S31")),
+        parse_reg_name(b"q31")
+    );
+}
+
+#[test]
+fn forward_store_tracks_full_mem_range() {
+    let fixture = "\
+libtiny.so!1000 0x7000: \"\tnop\"
+libtiny.so!1004 0x7004: \"\tstr\tq0, [x19]\" Q0=0x100f0e0d0c0b0a090807060504030201, X19=0x0000000000001000
+MEM W 0x1000 [16 bytes]: 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10  ................
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(fixture.as_bytes());
+
+    let mut e = TaintEngine::new();
+    e.set_mode(TrackMode::Forward);
+    e.set_source(TaintSource::from_reg(parse_reg_name(b"q0")));
+    e.run(p.lines(), 0);
+
+    let last = e.results().last().unwrap();
+    assert!(last.mem_snapshot.contains(&MemRange::new(0x1000, 16)));
+}
+
+#[test]
+fn backward_store_from_inner_mem_range_taints_source_reg() {
+    let fixture = "\
+libtiny.so!1004 0x7004: \"\tstr\tq0, [x19]\" Q0=0x100f0e0d0c0b0a090807060504030201, X19=0x0000000000001000
+MEM W 0x1000 [16 bytes]: 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10  ................
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(fixture.as_bytes());
+
+    let mut e = TaintEngine::new();
+    e.set_mode(TrackMode::Backward);
+    e.set_source(TaintSource::from_mem(0x100f));
+    e.run(p.lines(), 0);
+
+    let last = e.results().last().unwrap();
+    assert!(last.reg_snapshot[parse_reg_name(b"q0") as usize]);
+}
+
+#[test]
+fn backward_load_taints_mem_read_range() {
+    let fixture = "\
+libtiny.so!1004 0x7004: \"\tldr\tq0, [x19]\" X19=0x0000000000002000 => Q0=0x100f0e0d0c0b0a090807060504030201
+MEM R 0x2000 [16 bytes]: 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10  ................
+";
+    let mut p = TraceParser::new();
+    p.load_from_bytes(fixture.as_bytes());
+
+    let mut e = TaintEngine::new();
+    e.set_mode(TrackMode::Backward);
+    e.set_source(TaintSource::from_reg(parse_reg_name(b"q0")));
+    e.run(p.lines(), 0);
+
+    let last = e.results().last().unwrap();
+    assert!(last.mem_snapshot.contains(&MemRange::new(0x2000, 16)));
+}
+
+#[test]
 fn forward_taints_through_load_and_arith() {
     let p = parse_fixture();
     // Taint the mem the LDR reads -> should propagate into x0 then x1, then into mem written by STR.
@@ -89,7 +201,10 @@ fn forward_taints_through_load_and_arith() {
     );
     // After STR, the mem 0x77ac2226c0 should be tainted in the last propagation snapshot
     let last = results.last().unwrap();
-    assert!(last.mem_snapshot.contains(&0x77ac2226c0));
+    assert!(last
+        .mem_snapshot
+        .iter()
+        .any(|range| range.overlaps(MemRange::new(0x77ac2226c0, 8))));
 }
 
 #[test]
@@ -150,7 +265,10 @@ libtiny.so!1004 0x7004: \"\tmov\tx0, sp\" SP=0x77aca000 => X0=0x77aca000
     assert!(stp.has_mem_write);
     assert_eq!(stp.mem_write_addr, 0x77aca000);
     // Only one MEM W was observed but stp x29,x30 should infer the second.
-    assert!(stp.has_mem_write2, "stp with only 1 MEM W should be inferred");
+    assert!(
+        stp.has_mem_write2,
+        "stp with only 1 MEM W should be inferred"
+    );
     assert_eq!(stp.mem_write_addr2, 0x77aca008);
 }
 

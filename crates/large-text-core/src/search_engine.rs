@@ -159,7 +159,8 @@ impl SearchEngine {
                                 match std::str::from_utf8(chunk_bytes) {
                                     Ok(t) => std::borrow::Cow::Borrowed(t),
                                     Err(_) => {
-                                        let (cow, _, _) = reader_clone.encoding().decode(chunk_bytes);
+                                        let (cow, _, _) =
+                                            reader_clone.encoding().decode(chunk_bytes);
                                         cow
                                     }
                                 };
@@ -352,8 +353,7 @@ impl SearchEngine {
 
                 let handle = thread::spawn(move || {
                     let Some(regex) = regex_clone else {
-                        let _ =
-                            tx_clone.send(SearchMessage::Error("Invalid regex".to_string()));
+                        let _ = tx_clone.send(SearchMessage::Error("Invalid regex".to_string()));
                         return;
                     };
                     const BATCH_SIZE: usize = 16 * 1024 * 1024;

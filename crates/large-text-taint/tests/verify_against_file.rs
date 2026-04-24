@@ -99,9 +99,7 @@ fn verify_run(
             Some(ref gt) => {
                 // 两者必须完全一致
                 if parser_raw != gt.as_str() {
-                    eprintln!(
-                        "  ✗ {label} result[{i}] line={line_number}: MISMATCH!"
-                    );
+                    eprintln!("  ✗ {label} result[{i}] line={line_number}: MISMATCH!");
                     eprintln!("    parser:  {}", &parser_raw[..parser_raw.len().min(120)]);
                     eprintln!("    ground:  {}", &gt[..gt.len().min(120)]);
                     errors += 1;
@@ -307,5 +305,8 @@ fn verify_100_samples_against_raw_file() {
             total_errors
         );
     }
-    println!("✅ 全部 {} 条命中逐行对比原始文件,行号/ASM/地址 100% 一致。", total_checked);
+    println!(
+        "✅ 全部 {} 条命中逐行对比原始文件,行号/ASM/地址 100% 一致。",
+        total_checked
+    );
 }

@@ -4,7 +4,7 @@
 //! currently loaded mmap in a background thread, and reports results back via
 //! mpsc channels following the same pattern as `SearchEngine`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -12,10 +12,13 @@ use std::sync::Arc;
 use std::thread;
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use large_text_core::file_reader::FileReader;
-use large_text_taint::engine::{ResultEntry, StopReason, TaintEngine, TaintSource, TrackMode};
+use large_text_taint::engine::{
+    MemRange, ResultEntry, StopReason, TaintEngine, TaintSource, TrackMode,
+};
 use large_text_taint::parser::{read_raw_line, TraceParser};
-use large_text_taint::reg::{parse_reg_name, reg_name, REG_INVALID};
+use large_text_taint::reg::{normalize, parse_reg_name, reg_name, REG_INVALID};
 use large_text_taint::trace::TraceLine;
 
 /// Hit row info kept for fast highlight lookup + jump.
@@ -31,19 +34,69 @@ pub struct TaintHit {
     pub raw_line: String,      // full original trace line, shown as tooltip
     pub module_offset: String, // e.g. "libtiny.so!178dc8"
     pub addr: String,          // e.g. "0x76fed9fdc8"
-    pub asm: String,           // contents of the double-quoted asm string (tabs normalised to spaces)
-    pub tainted_text: String,  // "x0, x8, mem:0x1234" for table column + regex filter
+    pub asm: String, // contents of the double-quoted asm string (tabs normalised to spaces)
+    pub tainted_text: String, // "x0, x8, mem:0x1234" for filtering + details
     pub tainted_regs: Vec<String>,
-    pub tainted_mems: Vec<u64>,
+    pub tainted_mems: Vec<MemRange>,
+    pub delta_text: String, // "+x0, -x8, +mem:0x1234" relative to previous hit
+    pub delta_added_regs: Vec<String>,
+    pub delta_removed_regs: Vec<String>,
+    pub delta_added_mems: Vec<MemRange>,
+    pub delta_removed_mems: Vec<MemRange>,
+    pub note_text: String, // e.g. "libc.so!malloc(48)" for ExternalCall rows
+}
+
+// ---- Tree structures ----
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TaintTarget {
+    Reg(u8),
+    Mem(MemRange),
+}
+
+impl TaintTarget {
+    fn label(&self) -> String {
+        match self {
+            TaintTarget::Reg(id) => reg_name(*id).to_string(),
+            TaintTarget::Mem(range) => format_mem_range(*range),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TaintTreeNode {
+    pub target: TaintTarget,
+    pub insn_index: usize,
+    pub line_number: u32,
+    pub file_offset: u64,
+    pub asm: String,
+    pub raw_line: String,
+    pub children: Vec<TaintTreeNode>,
+}
+
+struct TreeEdge {
+    insn_index: usize,
+    parent: TaintTarget,
+    child: TaintTarget,
+}
+
+struct DisplayTraceLine {
+    line_number: u32,
+    file_offset: u64,
+    raw_line: String,
+    module_offset: String,
+    addr: String,
+    asm: String,
 }
 
 pub struct TaintCompleted {
     pub hits: Vec<TaintHit>,
+    pub tree: Option<TaintTreeNode>,
     pub stop_reason: StopReason,
     pub mode: TrackMode,
     pub source_label: String,
     pub instructions_parsed: usize,
-    pub formatted: String, // ready to be saved with "Save results"
+    pub formatted: String,
 }
 
 pub enum TaintMessage {
@@ -176,8 +229,7 @@ impl TaintState {
 
     /// Kick off a tracking job in a background thread using the dialog inputs.
     pub fn start_job(&mut self, reader: Arc<FileReader>) -> Result<(), String> {
-        let source = parse_source(&self.source_text)
-            .map_err(|e| format!("起点格式无效: {}", e))?;
+        let source = parse_source(&self.source_text).map_err(|e| format!("起点格式无效: {}", e))?;
         let start_line: u32 = self
             .start_line_text
             .trim()
@@ -341,16 +393,11 @@ fn run_job(job: JobConfig) {
     let start_off = match start_offset {
         Some(off) => off,
         None => {
-            let _ = tx.send(TaintMessage::Status(
-                "定位起始行...".to_string(),
-            ));
+            let _ = tx.send(TaintMessage::Status("定位起始行...".to_string()));
             match offset_of_line(bytes, start_line) {
                 Some(o) => o,
                 None => {
-                    let _ = tx.send(TaintMessage::Error(format!(
-                        "未找到起始行 {}",
-                        start_line
-                    )));
+                    let _ = tx.send(TaintMessage::Error(format!("未找到起始行 {}", start_line)));
                     return;
                 }
             }
@@ -429,7 +476,14 @@ fn run_job(job: JobConfig) {
     engine.set_source(source);
     engine.set_max_scan_distance(scan_limit);
     engine.set_cancel_token(cancel.clone());
-    engine.run(parser.lines(), start_index);
+    match mode {
+        TrackMode::Backward => {
+            engine.run_backward_with_mem_search(parser.lines(), start_index, bytes);
+        }
+        TrackMode::Forward => {
+            engine.run(parser.lines(), start_index);
+        }
+    }
 
     if cancel.load(Ordering::Relaxed) && engine.stop_reason() == StopReason::Cancelled {
         let _ = tx.send(TaintMessage::Error("已取消".to_string()));
@@ -439,14 +493,20 @@ fn run_job(job: JobConfig) {
     let formatted = engine.format_result(parser.lines(), bytes);
     let stop_reason = engine.stop_reason();
     let lines = parser.lines();
-    let hits = engine
-        .results()
-        .iter()
-        .map(|r| build_hit(r, lines, bytes))
-        .collect::<Vec<_>>();
+    let hits = build_hits(engine.results(), lines, bytes);
+
+    let tree = build_taint_tree(
+        engine.results(),
+        &source,
+        mode,
+        start_index,
+        parser.lines(),
+        bytes,
+    );
 
     let completed = TaintCompleted {
         hits,
+        tree,
         stop_reason,
         mode,
         source_label,
@@ -456,7 +516,334 @@ fn run_job(job: JobConfig) {
     let _ = tx.send(TaintMessage::Done(Box::new(completed)));
 }
 
-fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit {
+// ---- Tree building ----
+
+fn build_taint_tree(
+    results: &[ResultEntry],
+    source: &TaintSource,
+    mode: TrackMode,
+    start_index: usize,
+    lines: &[TraceLine],
+    bytes: &[u8],
+) -> Option<TaintTreeNode> {
+    if results.is_empty() {
+        return None;
+    }
+    let mut edges = collect_edges(results, source, mode, lines);
+    let root_target = if source.is_mem {
+        TaintTarget::Mem(MemRange::single(source.mem_addr))
+    } else {
+        TaintTarget::Reg(normalize(source.reg))
+    };
+    Some(match mode {
+        TrackMode::Backward => build_backward_subtree(
+            &root_target,
+            start_index,
+            start_index,
+            &mut edges,
+            lines,
+            bytes,
+            0,
+        ),
+        TrackMode::Forward => build_subtree(&root_target, start_index, &mut edges, lines, bytes, 0),
+    })
+}
+
+fn collect_edges(
+    results: &[ResultEntry],
+    source: &TaintSource,
+    mode: TrackMode,
+    lines: &[TraceLine],
+) -> Vec<TreeEdge> {
+    let mut edges = Vec::new();
+    let mut prev_regs = [false; 256];
+    let mut prev_mems: HashSet<MemRange> = HashSet::new();
+    if source.is_mem {
+        prev_mems.insert(MemRange::single(source.mem_addr));
+    } else {
+        prev_regs[normalize(source.reg) as usize] = true;
+    }
+
+    let entries: Vec<&ResultEntry> = match mode {
+        TrackMode::Backward => results.iter().rev().collect(),
+        TrackMode::Forward => results.iter().collect(),
+    };
+
+    for entry in entries {
+        let cur_regs = &entry.reg_snapshot;
+        let cur_mems: HashSet<MemRange> = entry.mem_snapshot.iter().copied().collect();
+
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        for r in 0..256u16 {
+            let ri = r as usize;
+            if prev_regs[ri] && !cur_regs[ri] {
+                removed.push(TaintTarget::Reg(r as u8));
+            }
+            if !prev_regs[ri] && cur_regs[ri] {
+                added.push(TaintTarget::Reg(r as u8));
+            }
+        }
+        for &range in &prev_mems {
+            if !cur_mems.contains(&range) {
+                removed.push(TaintTarget::Mem(range));
+            }
+        }
+        for &range in &cur_mems {
+            if !prev_mems.contains(&range) {
+                added.push(TaintTarget::Mem(range));
+            }
+        }
+
+        match mode {
+            TrackMode::Backward => {
+                // Parents = removed targets (untainted by this insn)
+                // PLUS dst regs that stayed tainted (re-tainted because
+                // the reg is both dst and src, e.g. `add x1, x1, x2`).
+                let mut parents = removed;
+                let tl = &lines[entry.index];
+                for d in 0..tl.num_dst as usize {
+                    let r = normalize(tl.dst_regs[d]);
+                    if prev_regs[r as usize] && cur_regs[r as usize] {
+                        let t = TaintTarget::Reg(r);
+                        if !parents.contains(&t) {
+                            parents.push(t);
+                        }
+                    }
+                }
+                for p in &parents {
+                    if added.is_empty() {
+                        edges.push(TreeEdge {
+                            insn_index: entry.index,
+                            parent: p.clone(),
+                            child: p.clone(),
+                        });
+                    } else {
+                        for c in &added {
+                            edges.push(TreeEdge {
+                                insn_index: entry.index,
+                                parent: p.clone(),
+                                child: c.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            TrackMode::Forward => {
+                if !added.is_empty() {
+                    let tl = &lines[entry.index];
+                    let mut parents = Vec::new();
+                    for s in 0..tl.num_src as usize {
+                        let r = normalize(tl.src_regs[s]);
+                        if prev_regs[r as usize] {
+                            let t = TaintTarget::Reg(r);
+                            if !parents.contains(&t) {
+                                parents.push(t);
+                            }
+                        }
+                    }
+                    if tl.has_mem_read {
+                        let read = MemRange::new(tl.mem_read_addr, tl.mem_read_size);
+                        if let Some(range) = prev_mems.iter().find(|range| range.overlaps(read)) {
+                            parents.push(TaintTarget::Mem(*range));
+                        }
+                    }
+                    if tl.has_mem_read2 {
+                        let read = MemRange::new(tl.mem_read_addr2, tl.mem_read_size2);
+                        if let Some(range) = prev_mems.iter().find(|range| range.overlaps(read)) {
+                            parents.push(TaintTarget::Mem(*range));
+                        }
+                    }
+                    for p in &parents {
+                        for c in &added {
+                            edges.push(TreeEdge {
+                                insn_index: entry.index,
+                                parent: p.clone(),
+                                child: c.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        prev_regs = *cur_regs;
+        prev_mems = cur_mems;
+    }
+    edges
+}
+
+fn build_subtree(
+    target: &TaintTarget,
+    insn_index: usize,
+    edges: &mut Vec<TreeEdge>,
+    lines: &[TraceLine],
+    bytes: &[u8],
+    depth: usize,
+) -> TaintTreeNode {
+    let mut child_nodes = Vec::new();
+    if depth < 200 {
+        let mut child_edges = Vec::new();
+        let mut i = 0;
+        while i < edges.len() {
+            if edges[i].parent == *target {
+                child_edges.push(edges.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        for ce in child_edges {
+            child_nodes.push(build_subtree(
+                &ce.child,
+                ce.insn_index,
+                edges,
+                lines,
+                bytes,
+                depth + 1,
+            ));
+        }
+    }
+
+    let display = display_trace_line_for_index(insn_index, lines, bytes);
+
+    TaintTreeNode {
+        target: target.clone(),
+        insn_index,
+        line_number: display.line_number,
+        file_offset: display.file_offset,
+        asm: display.asm,
+        raw_line: display.raw_line,
+        children: child_nodes,
+    }
+}
+
+fn build_backward_subtree(
+    target: &TaintTarget,
+    display_index: usize,
+    search_upper_bound: usize,
+    edges: &mut Vec<TreeEdge>,
+    lines: &[TraceLine],
+    bytes: &[u8],
+    depth: usize,
+) -> TaintTreeNode {
+    let mut child_nodes = Vec::new();
+    if depth < 200 {
+        let mut latest_step: Option<usize> = None;
+        for edge in edges.iter() {
+            if edge.parent == *target && edge.insn_index <= search_upper_bound {
+                latest_step =
+                    Some(latest_step.map_or(edge.insn_index, |best| best.max(edge.insn_index)));
+            }
+        }
+
+        if let Some(step_idx) = latest_step {
+            let mut child_edges = Vec::new();
+            let mut i = 0;
+            while i < edges.len() {
+                if edges[i].parent == *target && edges[i].insn_index == step_idx {
+                    child_edges.push(edges.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+
+            let has_self_child = child_edges.iter().any(|e| e.child == *target);
+            let has_earlier_same_target = edges
+                .iter()
+                .any(|e| e.parent == *target && e.insn_index < step_idx);
+
+            if has_earlier_same_target && !has_self_child {
+                child_nodes.push(build_backward_subtree(
+                    target,
+                    step_idx,
+                    step_idx.saturating_sub(1),
+                    edges,
+                    lines,
+                    bytes,
+                    depth + 1,
+                ));
+            }
+
+            for ce in child_edges {
+                child_nodes.push(build_backward_subtree(
+                    &ce.child,
+                    step_idx,
+                    step_idx.saturating_sub(1),
+                    edges,
+                    lines,
+                    bytes,
+                    depth + 1,
+                ));
+            }
+        }
+    }
+
+    let display = display_trace_line_for_index(display_index, lines, bytes);
+
+    TaintTreeNode {
+        target: target.clone(),
+        insn_index: display_index,
+        line_number: display.line_number,
+        file_offset: display.file_offset,
+        asm: display.asm,
+        raw_line: display.raw_line,
+        children: child_nodes,
+    }
+}
+
+fn build_hits(results: &[ResultEntry], lines: &[TraceLine], bytes: &[u8]) -> Vec<TaintHit> {
+    let mut out = Vec::with_capacity(results.len());
+    let mut prev_regs = [false; 256];
+    let mut prev_mems: HashSet<MemRange> = HashSet::new();
+
+    for entry in results {
+        let mut delta_added_regs = Vec::new();
+        let mut delta_removed_regs = Vec::new();
+        for i in 0..256u16 {
+            let idx = i as usize;
+            let was = prev_regs[idx];
+            let now = entry.reg_snapshot[idx];
+            if !was && now {
+                delta_added_regs.push(reg_name(i as u8).to_string());
+            } else if was && !now {
+                delta_removed_regs.push(reg_name(i as u8).to_string());
+            }
+        }
+
+        let current_mems: HashSet<MemRange> = entry.mem_snapshot.iter().copied().collect();
+        let mut delta_added_mems: Vec<MemRange> =
+            current_mems.difference(&prev_mems).copied().collect();
+        let mut delta_removed_mems: Vec<MemRange> =
+            prev_mems.difference(&current_mems).copied().collect();
+        delta_added_mems.sort_unstable();
+        delta_removed_mems.sort_unstable();
+
+        out.push(build_hit(
+            entry,
+            lines,
+            bytes,
+            delta_added_regs,
+            delta_removed_regs,
+            delta_added_mems,
+            delta_removed_mems,
+        ));
+
+        prev_regs = entry.reg_snapshot;
+        prev_mems = current_mems;
+    }
+
+    out
+}
+
+fn build_hit(
+    entry: &ResultEntry,
+    lines: &[TraceLine],
+    bytes: &[u8],
+    delta_added_regs: Vec<String>,
+    delta_removed_regs: Vec<String>,
+    delta_added_mems: Vec<MemRange>,
+    delta_removed_mems: Vec<MemRange>,
+) -> TaintHit {
     let tl = &lines[entry.index];
     let raw = read_raw_line(bytes, tl);
     let raw = raw.trim_end_matches(['\n', '\r']).to_string();
@@ -477,24 +864,7 @@ fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit
     //     "x0 来自这个外部调用的返回值"。
     let is_ext = tl.category == large_text_taint::trace::InsnCategory::ExternalCall;
 
-    // 对 ExternalCall,找前一条指令(br/blr)来展示
-    let (hit_line_number, hit_file_offset, hit_raw, module_offset, addr, asm) = if is_ext
-        && entry.index > 0
-    {
-        let prev_tl = &lines[entry.index - 1];
-        let prev_raw = read_raw_line(bytes, prev_tl);
-        let prev_raw = prev_raw.trim_end_matches(['\n', '\r']).to_string();
-        let (mo, ad, as_) = split_trace_line(&prev_raw);
-        (prev_tl.line_number, prev_tl.file_offset, prev_raw, mo, ad, as_)
-    } else if is_ext {
-        // ExternalCall 在第一条位置(没有前一条),退化显示
-        let func_name = extract_external_call_name(&raw);
-        (tl.line_number, tl.file_offset, raw.clone(),
-         "外部调用".to_string(), String::new(), func_name)
-    } else {
-        let (mo, ad, as_) = split_trace_line(&raw);
-        (tl.line_number, tl.file_offset, raw.clone(), mo, ad, as_)
-    };
+    let display = display_trace_line_for_index(entry.index, lines, bytes);
 
     // 污点集:ExternalCall 显示函数名,普通指令显示 tainted regs/mems
     let mut tainted_text = if is_ext {
@@ -504,24 +874,99 @@ fn build_hit(entry: &ResultEntry, lines: &[TraceLine], bytes: &[u8]) -> TaintHit
     };
     if !is_ext {
         // 普通指令才把 mems 追加到 regs 后面
-        for m in &mems {
+        for mem in format_mem_ranges(&mems) {
             if !tainted_text.is_empty() {
                 tainted_text.push_str(", ");
             }
-            tainted_text.push_str(&format!("mem:0x{:x}", m));
+            tainted_text.push_str(&mem);
         }
     }
 
+    let note_text = if is_ext {
+        extract_external_call_name(&raw)
+    } else {
+        String::new()
+    };
+
+    let mut delta_parts = Vec::new();
+    delta_parts.extend(delta_added_regs.iter().map(|reg| format!("+{}", reg)));
+    delta_parts.extend(delta_removed_regs.iter().map(|reg| format!("-{}", reg)));
+    delta_parts.extend(format_mem_delta('+', &delta_added_mems));
+    delta_parts.extend(format_mem_delta('-', &delta_removed_mems));
+
     TaintHit {
-        file_offset: hit_file_offset,
-        line_number: hit_line_number,
-        raw_line: hit_raw,
-        module_offset,
-        addr,
-        asm,
+        file_offset: display.file_offset,
+        line_number: display.line_number,
+        raw_line: display.raw_line,
+        module_offset: display.module_offset,
+        addr: display.addr,
+        asm: display.asm,
         tainted_text,
         tainted_regs: regs,
         tainted_mems: mems,
+        delta_text: delta_parts.join(", "),
+        delta_added_regs,
+        delta_removed_regs,
+        delta_added_mems,
+        delta_removed_mems,
+        note_text,
+    }
+}
+
+fn display_trace_line_for_index(
+    index: usize,
+    lines: &[TraceLine],
+    bytes: &[u8],
+) -> DisplayTraceLine {
+    let Some(tl) = lines.get(index) else {
+        return DisplayTraceLine {
+            line_number: 0,
+            file_offset: 0,
+            raw_line: String::new(),
+            module_offset: String::new(),
+            addr: String::new(),
+            asm: String::new(),
+        };
+    };
+
+    let raw = read_raw_line(bytes, tl);
+    let raw = raw.trim_end_matches(['\n', '\r']).to_string();
+    let is_ext = tl.category == large_text_taint::trace::InsnCategory::ExternalCall;
+
+    if is_ext && index > 0 {
+        let prev_tl = &lines[index - 1];
+        let prev_raw = read_raw_line(bytes, prev_tl);
+        let prev_raw = prev_raw.trim_end_matches(['\n', '\r']).to_string();
+        let (module_offset, addr, asm) = split_trace_line(&prev_raw);
+        return DisplayTraceLine {
+            line_number: prev_tl.line_number,
+            file_offset: prev_tl.file_offset,
+            raw_line: prev_raw,
+            module_offset,
+            addr,
+            asm,
+        };
+    }
+
+    if is_ext {
+        return DisplayTraceLine {
+            line_number: tl.line_number,
+            file_offset: tl.file_offset,
+            raw_line: raw.clone(),
+            module_offset: "外部调用".to_string(),
+            addr: String::new(),
+            asm: extract_external_call_name(&raw),
+        };
+    }
+
+    let (module_offset, addr, asm) = split_trace_line(&raw);
+    DisplayTraceLine {
+        line_number: tl.line_number,
+        file_offset: tl.file_offset,
+        raw_line: raw,
+        module_offset,
+        addr,
+        asm,
     }
 }
 
@@ -654,6 +1099,44 @@ pub fn source_display(src: &TaintSource) -> String {
     format_source_label(src)
 }
 
+fn format_mem_ranges(ranges: &[MemRange]) -> Vec<String> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut out = Vec::new();
+    let mut current = sorted[0];
+    for &range in sorted.iter().skip(1) {
+        if current.touches_or_overlaps(range) {
+            let end = current.end().max(range.end());
+            current = MemRange::new(current.addr, (end - current.addr).min(u8::MAX as u64) as u8);
+            continue;
+        }
+        out.push(format_mem_range(current));
+        current = range;
+    }
+    out.push(format_mem_range(current));
+    out
+}
+
+fn format_mem_range(range: MemRange) -> String {
+    if range.size <= 1 {
+        format!("mem:0x{:x}", range.addr)
+    } else {
+        format!("mem:0x{:x}..0x{:x}", range.addr, range.end() - 1)
+    }
+}
+
+fn format_mem_delta(prefix: char, ranges: &[MemRange]) -> Vec<String> {
+    format_mem_ranges(ranges)
+        .into_iter()
+        .map(|s| format!("{}{}", prefix, s))
+        .collect()
+}
+
 fn parse_source(s: &str) -> Result<TaintSource, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -726,15 +1209,13 @@ pub fn render_dialog(
                 let bwd_sel = state.mode == TrackMode::Backward;
                 if ui
                     .add(
-                        egui::Button::new(
-                            egui::RichText::new("→  向前")
-                                .size(13.0)
-                                .color(if fwd_sel {
-                                    egui::Color32::BLACK
-                                } else {
-                                    FORWARD_COLOR
-                                }),
-                        )
+                        egui::Button::new(egui::RichText::new("→  向前").size(13.0).color(
+                            if fwd_sel {
+                                egui::Color32::BLACK
+                            } else {
+                                FORWARD_COLOR
+                            },
+                        ))
                         .fill(if fwd_sel {
                             FORWARD_COLOR
                         } else {
@@ -748,15 +1229,13 @@ pub fn render_dialog(
                 }
                 if ui
                     .add(
-                        egui::Button::new(
-                            egui::RichText::new("←  向后")
-                                .size(13.0)
-                                .color(if bwd_sel {
-                                    egui::Color32::BLACK
-                                } else {
-                                    BACKWARD_COLOR
-                                }),
-                        )
+                        egui::Button::new(egui::RichText::new("←  向后").size(13.0).color(
+                            if bwd_sel {
+                                egui::Color32::BLACK
+                            } else {
+                                BACKWARD_COLOR
+                            },
+                        ))
                         .fill(if bwd_sel {
                             BACKWARD_COLOR
                         } else {
@@ -799,12 +1278,9 @@ pub fn render_dialog(
                 ui.horizontal(|ui| {
                     ui.label("扫描上限:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut state.scan_limit_text)
-                            .desired_width(80.0),
+                        egui::TextEdit::singleline(&mut state.scan_limit_text).desired_width(80.0),
                     )
-                    .on_hover_text(
-                        "连续 N 条指令无污点传播则停止",
-                    );
+                    .on_hover_text("连续 N 条指令无污点传播则停止");
                 });
                 if state.mode == TrackMode::Forward {
                     ui.horizontal(|ui| {
@@ -859,10 +1335,8 @@ pub fn render_dialog(
                 if state.running
                     && ui
                         .add(
-                            egui::Button::new(
-                                egui::RichText::new("取消当前任务").size(13.0),
-                            )
-                            .min_size(egui::vec2(120.0, 28.0)),
+                            egui::Button::new(egui::RichText::new("取消当前任务").size(13.0))
+                                .min_size(egui::vec2(120.0, 28.0)),
                         )
                         .clicked()
                 {
@@ -948,34 +1422,43 @@ pub fn render_panel(ctx: &egui::Context, state: &mut TaintState) -> Option<u64> 
         render_panel_header_summary(ui, completed);
 
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("过滤")
-                    .size(11.0)
-                    .color(egui::Color32::from_rgb(150, 150, 150)),
-            );
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut state.filter_text)
-                    .hint_text("子串匹配,任意列(例: ldr / mem:0xac2 / x8)")
-                    .desired_width(f32::INFINITY),
-            );
-            if resp.changed() {
-                state.filter_dirty = true;
-            }
-        });
-        let shown = state.filtered_indices.len();
-        let total = state.completed.as_ref().map_or(0, |c| c.hits.len());
         ui.label(
-            egui::RichText::new(format!(
-                "显示 {} / {} 条 — 双击跳转到对应 trace 行",
-                shown, total
-            ))
-            .size(11.0)
-            .color(egui::Color32::from_rgb(160, 160, 160)),
+            egui::RichText::new("双击节点跳转到对应 trace 行")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(160, 160, 160)),
         );
         ui.add_space(4.0);
 
+        ui.add_space(2.0);
+        render_hits_toolbar(ui, state);
+        ui.add_space(4.0);
+
         clicked_offset = render_hits_table(ui, state);
+
+        if state
+            .completed
+            .as_ref()
+            .and_then(|c| c.tree.as_ref())
+            .is_some()
+        {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("污点路径图")
+                .id_salt("taint_tree_section")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "树图按污点目标压缩显示；逐条命中数量和跳转以表格为准。",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(160, 160, 160)),
+                    );
+                    ui.add_space(4.0);
+                    if let Some(offset) = render_taint_tree(ui, state) {
+                        clicked_offset = Some(offset);
+                    }
+                });
+        }
     };
 
     // Dock as a side panel / bottom panel. The central text area takes
@@ -1075,12 +1558,10 @@ fn render_chip(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.add(egui::Label::new(
-                egui::RichText::new(text)
-                    .monospace()
-                    .size(12.0)
-                    .color(fg),
-            ).selectable(false));
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).monospace().size(12.0).color(fg))
+                    .selectable(false),
+            );
         });
 }
 
@@ -1203,15 +1684,11 @@ fn render_panel_mini_toolbar(
         );
         let mut dock_btn = |ui: &mut egui::Ui, label: &str, side: DockSide, tip: &str| {
             let selected = *dock_side == side;
-            let btn = egui::Button::new(
-                egui::RichText::new(label)
-                    .size(14.0)
-                    .color(if selected {
-                        egui::Color32::BLACK
-                    } else {
-                        egui::Color32::from_rgb(210, 210, 210)
-                    }),
-            )
+            let btn = egui::Button::new(egui::RichText::new(label).size(14.0).color(if selected {
+                egui::Color32::BLACK
+            } else {
+                egui::Color32::from_rgb(210, 210, 210)
+            }))
             .fill(if selected {
                 egui::Color32::from_rgb(255, 210, 100)
             } else {
@@ -1323,6 +1800,559 @@ fn render_panel_header_summary(ui: &mut egui::Ui, completed: &TaintCompleted) {
     ui.add_space(4.0);
 }
 
+fn render_hits_toolbar(ui: &mut egui::Ui, state: &mut TaintState) {
+    let total = state.completed.as_ref().map(|c| c.hits.len()).unwrap_or(0);
+    let shown = state.filtered_indices.len();
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("命中明细")
+                .size(12.0)
+                .strong()
+                .color(egui::Color32::from_rgb(255, 210, 100)),
+        );
+        ui.separator();
+
+        let count_text = if shown == total {
+            format!("显示 {} 条", shown)
+        } else {
+            format!("显示 {}/{} 条", shown, total)
+        };
+        ui.label(
+            egui::RichText::new(count_text)
+                .size(11.0)
+                .color(egui::Color32::from_rgb(180, 180, 180)),
+        );
+
+        ui.separator();
+        ui.label(
+            egui::RichText::new("过滤")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(150, 150, 150)),
+        );
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.filter_text)
+                .hint_text("行号 / 模块 / 地址 / 汇编 / 污点")
+                .desired_width(220.0),
+        );
+        if resp.changed() {
+            state.filter_dirty = true;
+        }
+        if !state.filter_text.is_empty()
+            && ui
+                .add(egui::Button::new(egui::RichText::new("清空").size(11.0)))
+                .clicked()
+        {
+            state.filter_text.clear();
+            state.filter_dirty = true;
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("单击行高亮主视图，双击跳回原始 trace。")
+            .size(11.0)
+            .color(egui::Color32::from_rgb(160, 160, 160)),
+    );
+}
+
+fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
+    let table_height = ui.available_height().clamp(140.0, 320.0);
+
+    let (jump_to, next_selected_hit, next_selected_offset) = {
+        let Some(completed) = state.completed.as_ref() else {
+            return None;
+        };
+        let filtered_indices = &state.filtered_indices;
+        let selected_hit = state.selected_hit;
+        let selected_offset = state.selected_offset;
+
+        if filtered_indices.is_empty() {
+            egui::Frame::NONE
+                .fill(ui.visuals().faint_bg_color)
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("当前过滤条件没有匹配到任何命中。")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(180, 180, 180)),
+                    );
+                });
+            return None;
+        }
+
+        let text_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let row_h = text_h + 6.0;
+        let mut jump_to = None;
+        let mut next_selected_hit = None;
+        let mut next_selected_offset = None;
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .vscroll(true)
+            .max_scroll_height(table_height)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(58.0).at_least(44.0))
+            .column(Column::initial(150.0).at_least(100.0))
+            .column(Column::initial(124.0).at_least(90.0))
+            .column(Column::initial(260.0).at_least(160.0))
+            .column(Column::remainder().at_least(140.0))
+            .header(22.0, |mut header| {
+                let hfmt = |s: &str| {
+                    egui::RichText::new(s)
+                        .size(12.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(210, 210, 210))
+                };
+                header.col(|ui| {
+                    ui.label(hfmt("Line"));
+                });
+                header.col(|ui| {
+                    ui.label(hfmt("Module!Offset"));
+                });
+                header.col(|ui| {
+                    ui.label(hfmt("Addr"));
+                });
+                header.col(|ui| {
+                    ui.label(hfmt("ASM"));
+                });
+                header.col(|ui| {
+                    ui.label(hfmt("Tainted"));
+                });
+            })
+            .body(|body| {
+                body.rows(row_h, filtered_indices.len(), |mut row| {
+                    let filtered_idx = filtered_indices[row.index()];
+                    let hit = &completed.hits[filtered_idx];
+                    let is_selected = selected_hit == Some(filtered_idx)
+                        || selected_offset == Some(hit.file_offset);
+                    row.set_selected(is_selected);
+
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(hit.line_number.to_string())
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(255, 210, 120)),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&hit.module_offset)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(180, 220, 255)),
+                            )
+                            .selectable(false)
+                            .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&hit.addr)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(170, 200, 240)),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&hit.asm)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(225, 225, 225)),
+                            )
+                            .selectable(false)
+                            .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&hit.tainted_text)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(190, 240, 190)),
+                            )
+                            .selectable(false)
+                            .truncate(),
+                        );
+                    });
+
+                    let row_resp = row.response().on_hover_text(&hit.raw_line);
+                    if row_resp.clicked() {
+                        next_selected_hit = Some(filtered_idx);
+                        next_selected_offset = Some(hit.file_offset);
+                    }
+                    if row_resp.double_clicked() {
+                        next_selected_hit = Some(filtered_idx);
+                        next_selected_offset = Some(hit.file_offset);
+                        jump_to = Some(hit.file_offset);
+                    }
+                });
+            });
+
+        (jump_to, next_selected_hit, next_selected_offset)
+    };
+
+    if let Some(hit_idx) = next_selected_hit {
+        state.selected_hit = Some(hit_idx);
+    }
+    if let Some(offset) = next_selected_offset {
+        state.selected_offset = Some(offset);
+    }
+
+    jump_to
+}
+
+// ---- Tree topology rendering ----
+
+struct TreeGraphNodeLayout<'a> {
+    node: &'a TaintTreeNode,
+    rect: egui::Rect,
+}
+
+const TREE_GRAPH_MARGIN: f32 = 18.0;
+const TREE_GRAPH_COL_GAP: f32 = 44.0;
+const TREE_GRAPH_ROW_GAP: f32 = 20.0;
+const TREE_NODE_PAD_X: f32 = 12.0;
+const TREE_NODE_PAD_Y: f32 = 9.0;
+const TREE_NODE_MIN_W: f32 = 144.0;
+const TREE_NODE_MIN_H: f32 = 36.0;
+
+fn render_taint_tree(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
+    let tree_ptr: *const TaintTreeNode = state.completed.as_ref()?.tree.as_ref()?;
+    // SAFETY: `state.completed` is not mutated inside the render call;
+    // only `state.selected_offset` is written.
+    let tree: &TaintTreeNode = unsafe { &*tree_ptr };
+    let mut jump_to: Option<u64> = None;
+    egui::Frame::NONE
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            egui::ScrollArea::both()
+                .id_salt("taint_tree_graph_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    render_taint_graph(ui, tree, &mut state.selected_offset, &mut jump_to);
+                });
+        });
+    jump_to
+}
+
+fn render_taint_graph(
+    ui: &mut egui::Ui,
+    tree: &TaintTreeNode,
+    selected_offset: &mut Option<u64>,
+    jump_to: &mut Option<u64>,
+) {
+    let mut level_heights = Vec::new();
+    collect_tree_level_heights(ui, tree, 0, &mut level_heights);
+    let level_y = tree_level_positions(&level_heights);
+    let mut subtree_widths: HashMap<*const TaintTreeNode, f32> = HashMap::new();
+    measure_tree_subtree_widths(ui, tree, &mut subtree_widths);
+
+    let mut layouts = Vec::new();
+    let mut root_left = TREE_GRAPH_MARGIN;
+    let mut max_right = 0.0;
+    let mut max_bottom = 0.0;
+    layout_tree_graph(
+        ui,
+        tree,
+        0,
+        &mut root_left,
+        &subtree_widths,
+        &level_y,
+        &mut layouts,
+        &mut max_right,
+        &mut max_bottom,
+    );
+
+    let desired = egui::vec2(
+        (max_right + TREE_GRAPH_MARGIN).max(ui.available_width()),
+        max_bottom + TREE_GRAPH_MARGIN,
+    );
+    let (graph_rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let offset = graph_rect.min.to_vec2();
+    let painter = ui.painter_at(graph_rect);
+
+    let mut rects: HashMap<*const TaintTreeNode, egui::Rect> =
+        HashMap::with_capacity(layouts.len());
+    for layout in &layouts {
+        rects.insert(layout.node as *const _, layout.rect.translate(offset));
+    }
+
+    paint_tree_graph_edges(
+        &painter,
+        tree,
+        &rects,
+        egui::Stroke::new(1.4, egui::Color32::from_rgb(88, 88, 96)),
+    );
+
+    for layout in &layouts {
+        let rect = match rects.get(&(layout.node as *const _)) {
+            Some(rect) => *rect,
+            None => continue,
+        };
+        let target_label = layout.node.target.label();
+        let id = ui.id().with((
+            "taint_tree_graph_node",
+            layout.node.insn_index,
+            layout.node.file_offset,
+            &target_label,
+        ));
+        let response = ui
+            .interact(rect, id, egui::Sense::click())
+            .on_hover_text(&layout.node.raw_line);
+        if response.clicked() {
+            *selected_offset = Some(layout.node.file_offset);
+        }
+        if response.double_clicked() {
+            *selected_offset = Some(layout.node.file_offset);
+            *jump_to = Some(layout.node.file_offset);
+        }
+        paint_tree_graph_node(
+            ui,
+            &painter,
+            layout.node,
+            rect,
+            response.hovered(),
+            *selected_offset == Some(layout.node.file_offset),
+        );
+    }
+}
+
+fn collect_tree_level_heights(
+    ui: &egui::Ui,
+    node: &TaintTreeNode,
+    depth: usize,
+    heights: &mut Vec<f32>,
+) {
+    let size = tree_node_size(ui, node);
+    if heights.len() <= depth {
+        heights.resize(depth + 1, 0.0);
+    }
+    heights[depth] = heights[depth].max(size.y);
+    for child in &node.children {
+        collect_tree_level_heights(ui, child, depth + 1, heights);
+    }
+}
+
+fn tree_level_positions(heights: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(heights.len());
+    let mut y = TREE_GRAPH_MARGIN;
+    for height in heights {
+        out.push(y);
+        y += *height + TREE_GRAPH_ROW_GAP;
+    }
+    out
+}
+
+fn measure_tree_subtree_widths(
+    ui: &egui::Ui,
+    node: &TaintTreeNode,
+    widths: &mut HashMap<*const TaintTreeNode, f32>,
+) -> f32 {
+    let own_width = tree_node_size(ui, node).x;
+    let children_total = if node.children.is_empty() {
+        0.0
+    } else {
+        let mut total = 0.0;
+        for (i, child) in node.children.iter().enumerate() {
+            if i > 0 {
+                total += TREE_GRAPH_COL_GAP;
+            }
+            total += measure_tree_subtree_widths(ui, child, widths);
+        }
+        total
+    };
+    let subtree_width = own_width.max(children_total);
+    widths.insert(node as *const _, subtree_width);
+    subtree_width
+}
+
+fn layout_tree_graph<'a>(
+    ui: &egui::Ui,
+    node: &'a TaintTreeNode,
+    depth: usize,
+    left: &mut f32,
+    subtree_widths: &HashMap<*const TaintTreeNode, f32>,
+    level_y: &[f32],
+    out: &mut Vec<TreeGraphNodeLayout<'a>>,
+    max_right: &mut f32,
+    max_bottom: &mut f32,
+) -> egui::Rect {
+    let size = tree_node_size(ui, node);
+    let subtree_width = subtree_widths
+        .get(&(node as *const _))
+        .copied()
+        .unwrap_or(size.x);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(*left + (subtree_width - size.x) * 0.5, level_y[depth]),
+        size,
+    );
+    *max_right = (*max_right).max(rect.right());
+    *max_bottom = (*max_bottom).max(rect.bottom());
+    out.push(TreeGraphNodeLayout { node, rect });
+
+    if !node.children.is_empty() {
+        let children_total: f32 = node
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, child)| {
+                let gap = if i == 0 { 0.0 } else { TREE_GRAPH_COL_GAP };
+                gap + subtree_widths
+                    .get(&(child as *const _))
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .sum();
+        let mut child_left = *left + (subtree_width - children_total) * 0.5;
+        for child in &node.children {
+            let child_width = subtree_widths
+                .get(&(child as *const _))
+                .copied()
+                .unwrap_or_else(|| tree_node_size(ui, child).x);
+            layout_tree_graph(
+                ui,
+                child,
+                depth + 1,
+                &mut child_left,
+                subtree_widths,
+                level_y,
+                out,
+                max_right,
+                max_bottom,
+            );
+            child_left += child_width + TREE_GRAPH_COL_GAP;
+        }
+    }
+    rect
+}
+
+fn paint_tree_graph_edges(
+    painter: &egui::Painter,
+    node: &TaintTreeNode,
+    rects: &HashMap<*const TaintTreeNode, egui::Rect>,
+    stroke: egui::Stroke,
+) {
+    let Some(parent_rect) = rects.get(&(node as *const _)).copied() else {
+        return;
+    };
+    let start = egui::pos2(parent_rect.center().x, parent_rect.bottom());
+    for child in &node.children {
+        if let Some(child_rect) = rects.get(&(child as *const _)).copied() {
+            let end = egui::pos2(child_rect.center().x, child_rect.top());
+            let bend_y = start.y + ((end.y - start.y) * 0.5).max(18.0);
+            painter.line_segment([start, egui::pos2(start.x, bend_y)], stroke);
+            painter.line_segment(
+                [egui::pos2(start.x, bend_y), egui::pos2(end.x, bend_y)],
+                stroke,
+            );
+            painter.line_segment([egui::pos2(end.x, bend_y), end], stroke);
+        }
+        paint_tree_graph_edges(painter, child, rects, stroke);
+    }
+}
+
+fn paint_tree_graph_node(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    node: &TaintTreeNode,
+    rect: egui::Rect,
+    hovered: bool,
+    selected: bool,
+) {
+    let accent = tree_target_color(&node.target);
+    let fill = if selected {
+        accent.linear_multiply(0.22)
+    } else if hovered {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().extreme_bg_color
+    };
+    let stroke = if selected {
+        egui::Stroke::new(2.0, accent)
+    } else if hovered {
+        egui::Stroke::new(1.6, accent.linear_multiply(0.8))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 78))
+    };
+
+    painter.rect_filled(rect, egui::CornerRadius::same(8), fill);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(8),
+        stroke,
+        egui::StrokeKind::Outside,
+    );
+
+    let strip = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 4.0, rect.max.y));
+    painter.rect_filled(strip, egui::CornerRadius::same(8), accent);
+
+    let galley = ui.fonts(|f| f.layout_job(tree_node_job(node)));
+    painter.galley(
+        rect.min + egui::vec2(TREE_NODE_PAD_X, TREE_NODE_PAD_Y),
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
+fn tree_target_color(target: &TaintTarget) -> egui::Color32 {
+    match target {
+        TaintTarget::Reg(_) => egui::Color32::from_rgb(150, 210, 255),
+        TaintTarget::Mem(_) => egui::Color32::from_rgb(220, 180, 255),
+    }
+}
+
+fn tree_node_size(ui: &egui::Ui, node: &TaintTreeNode) -> egui::Vec2 {
+    let galley = ui.fonts(|f| f.layout_job(tree_node_job(node)));
+    egui::vec2(
+        (galley.size().x + TREE_NODE_PAD_X * 2.0).max(TREE_NODE_MIN_W),
+        (galley.size().y + TREE_NODE_PAD_Y * 2.0).max(TREE_NODE_MIN_H),
+    )
+}
+
+fn tree_node_job(node: &TaintTreeNode) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let mono = |size: f32, color: egui::Color32| egui::TextFormat {
+        font_id: egui::FontId::monospace(size),
+        color,
+        ..Default::default()
+    };
+    let target_color = match &node.target {
+        TaintTarget::Reg(_) => egui::Color32::from_rgb(150, 210, 255),
+        TaintTarget::Mem(_) => egui::Color32::from_rgb(220, 180, 255),
+    };
+    job.append(&node.target.label(), 0.0, mono(12.0, target_color));
+    job.append(
+        &format!("  L{}", node.line_number),
+        0.0,
+        mono(11.0, egui::Color32::from_rgb(255, 210, 120)),
+    );
+    if !node.asm.is_empty() {
+        job.append(
+            &format!("  {}", node.asm),
+            0.0,
+            mono(11.0, egui::Color32::from_rgb(180, 180, 180)),
+        );
+    }
+    job
+}
+
 fn rebuild_filter(state: &mut TaintState) {
     if let Some(completed) = &state.completed {
         let q = state.filter_text.trim().to_lowercase();
@@ -1337,12 +2367,17 @@ fn rebuild_filter(state: &mut TaintState) {
             .filter_map(|(i, h)| {
                 fn contains_ci(haystack: &str, needle: &str) -> bool {
                     let n = needle.len();
-                    if n == 0 { return true; }
-                    if n > haystack.len() { return false; }
+                    if n == 0 {
+                        return true;
+                    }
+                    if n > haystack.len() {
+                        return false;
+                    }
                     let nb = needle.as_bytes();
-                    haystack.as_bytes().windows(n).any(|w| {
-                        w.iter().zip(nb).all(|(a, b)| a.to_ascii_lowercase() == *b)
-                    })
+                    haystack
+                        .as_bytes()
+                        .windows(n)
+                        .any(|w| w.iter().zip(nb).all(|(a, b)| a.to_ascii_lowercase() == *b))
                 }
                 if contains_ci(&h.module_offset, &q)
                     || contains_ci(&h.addr, &q)
@@ -1360,245 +2395,114 @@ fn rebuild_filter(state: &mut TaintState) {
     }
 }
 
-/// Table view — five columns like taint_gui.py (Line / Module!Offset / Addr /
-/// ASM / Tainted). Double-click a row to jump. Returns the target row on jump.
-fn render_hits_table(ui: &mut egui::Ui, state: &mut TaintState) -> Option<u64> {
-    use egui_extras::{Column, TableBuilder};
-
-    let mut jump_to: Option<u64> = None;
-    let text_h = ui.text_style_height(&egui::TextStyle::Monospace);
-    let row_h = text_h + 6.0;
-
-    let total_rows = state.filtered_indices.len();
-    let completed_ref = state.completed.as_ref()?;
-    let hits_ptr: *const Vec<TaintHit> = &completed_ref.hits;
-    // SAFETY: `state.completed` is held for the duration of this function and
-    // not mutated from inside the closures below; we only need a shared borrow.
-    let hits: &Vec<TaintHit> = unsafe { &*hits_ptr };
-    let filtered_ptr: *const Vec<usize> = &state.filtered_indices;
-    let filtered: &Vec<usize> = unsafe { &*filtered_ptr };
-
-    TableBuilder::new(ui)
-        .striped(true)
-        .resizable(true)
-        // Row-level click sense — cell labels themselves stay non-interactive
-        // so they can never steal focus from TextEdits elsewhere (e.g. the
-        // Ctrl+F search bar).
-        .sense(egui::Sense::click())
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::initial(70.0).at_least(50.0))
-        .column(Column::initial(170.0).at_least(80.0))
-        .column(Column::initial(130.0).at_least(80.0))
-        .column(Column::initial(460.0).at_least(180.0))
-        .column(Column::remainder().at_least(120.0))
-        .header(22.0, |mut header| {
-            let hfmt = |s: &str| {
-                egui::RichText::new(s)
-                    .size(12.0)
-                    .strong()
-                    .color(egui::Color32::from_rgb(210, 210, 210))
-            };
-            header.col(|ui| {
-                ui.label(hfmt("行号"));
-            });
-            header.col(|ui| {
-                ui.label(hfmt("模块!偏移"));
-            });
-            header.col(|ui| {
-                ui.label(hfmt("地址"));
-            });
-            header.col(|ui| {
-                ui.label(hfmt("汇编"));
-            });
-            header.col(|ui| {
-                ui.label(hfmt("污点集"));
-            });
-        })
-        .body(|body| {
-            body.rows(row_h, total_rows, |mut row| {
-                let row_i = row.index();
-                let hit_idx = filtered[row_i];
-                let hit = &hits[hit_idx];
-                let is_sel = state.selected_hit == Some(hit_idx);
-                row.set_selected(is_sel);
-
-                let line_txt = egui::RichText::new(hit.line_number.to_string())
-                    .monospace()
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(255, 210, 120));
-                let module_txt = egui::RichText::new(&hit.module_offset)
-                    .monospace()
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(180, 210, 240));
-                let addr_txt = egui::RichText::new(&hit.addr)
-                    .monospace()
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(160, 160, 160));
-                let asm_job = format_asm_job(&hit.asm);
-                let tainted_job = format_tainted_job(hit);
-
-                row.col(|ui| {
-                    ui.add(egui::Label::new(line_txt).selectable(false));
-                });
-                row.col(|ui| {
-                    ui.add(egui::Label::new(module_txt).selectable(false));
-                });
-                row.col(|ui| {
-                    ui.add(egui::Label::new(addr_txt).selectable(false));
-                });
-                row.col(|ui| {
-                    ui.add(egui::Label::new(asm_job).selectable(false).truncate());
-                });
-                row.col(|ui| {
-                    ui.add(egui::Label::new(tainted_job).selectable(false).truncate());
-                });
-
-                // One interact rect for the whole row — cells above have no
-                // Sense, so the search bar (and any other TextEdit) keeps its
-                // focus even when the panel is on screen.
-                let row_resp = row.response().on_hover_text(&hit.raw_line);
-                if row_resp.clicked() {
-                    state.selected_hit = Some(hit_idx);
-                    state.selected_offset = Some(hit.file_offset);
-                }
-                if row_resp.double_clicked() {
-                    state.selected_hit = Some(hit_idx);
-                    state.selected_offset = Some(hit.file_offset);
-                    jump_to = Some(hit.file_offset);
-                }
-            });
-        });
-
-    jump_to
-}
-
-/// Colour the ASM column: mnemonic in orange, register tokens in blue, rest in
-/// light gray. Kept compact because it gets drawn once per visible row.
-fn format_asm_job(asm: &str) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let mono = |size: f32, color: egui::Color32| egui::TextFormat {
-        font_id: egui::FontId::monospace(size),
-        color,
-        ..Default::default()
-    };
-    let bright = egui::Color32::from_rgb(225, 225, 225);
-    let mnem_color = egui::Color32::from_rgb(255, 180, 100);
-    let reg_color = egui::Color32::from_rgb(150, 210, 255);
-    let imm_color = egui::Color32::from_rgb(180, 230, 180);
-
-    let trimmed = asm.trim_start();
-    let pad_len = asm.len() - trimmed.len();
-    if pad_len > 0 {
-        job.append(&asm[..pad_len], 0.0, mono(12.0, bright));
-    }
-    let rest = trimmed;
-    let mnem_end = rest
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(rest.len());
-    job.append(&rest[..mnem_end], 0.0, mono(12.0, mnem_color));
-    let operands = &rest[mnem_end..];
-    let bytes = operands.as_bytes();
-    let mut last = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        if is_word_start(bytes, i) {
-            let start = i;
-            while i < bytes.len() && (bytes[i] as char).is_ascii_alphanumeric() {
-                i += 1;
-            }
-            let tok = &operands[start..i];
-            if parse_reg_name(tok.as_bytes()) != REG_INVALID {
-                if start > last {
-                    job.append(&operands[last..start], 0.0, mono(12.0, bright));
-                }
-                job.append(tok, 0.0, mono(12.0, reg_color));
-                last = i;
-            }
-        } else if bytes[i] == b'#' {
-            let start = i;
-            i += 1;
-            while i < bytes.len()
-                && !(bytes[i] as char).is_whitespace()
-                && bytes[i] != b','
-                && bytes[i] != b']'
-            {
-                i += 1;
-            }
-            if start > last {
-                job.append(&operands[last..start], 0.0, mono(12.0, bright));
-            }
-            job.append(&operands[start..i], 0.0, mono(12.0, imm_color));
-            last = i;
-        } else {
-            i += 1;
-        }
-    }
-    if last < operands.len() {
-        job.append(&operands[last..], 0.0, mono(12.0, bright));
-    }
-    job
-}
-
-fn format_tainted_job(hit: &TaintHit) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let mono = |color: egui::Color32| egui::TextFormat {
-        font_id: egui::FontId::monospace(12.0),
-        color,
-        ..Default::default()
-    };
-    if hit.tainted_regs.is_empty() && hit.tainted_mems.is_empty() {
-        job.append(
-            "∅",
-            0.0,
-            mono(egui::Color32::from_rgb(120, 120, 120)),
-        );
-        return job;
-    }
-    let mut first = true;
-    for r in &hit.tainted_regs {
-        if !first {
-            job.append(", ", 0.0, mono(egui::Color32::from_rgb(120, 120, 120)));
-        }
-        let color = match r.as_str() {
-            "fp" | "lr" | "sp" => egui::Color32::from_rgb(255, 210, 150),
-            "nzcv" => egui::Color32::from_rgb(255, 170, 210),
-            _ if r.starts_with('q') || r.starts_with('d') || r.starts_with('s') => {
-                egui::Color32::from_rgb(170, 230, 170)
-            }
-            _ => egui::Color32::from_rgb(150, 210, 255),
-        };
-        job.append(r, 0.0, mono(color));
-        first = false;
-    }
-    for m in &hit.tainted_mems {
-        if !first {
-            job.append(", ", 0.0, mono(egui::Color32::from_rgb(120, 120, 120)));
-        }
-        job.append(
-            &format!("mem:0x{:x}", m),
-            0.0,
-            mono(egui::Color32::from_rgb(220, 180, 255)),
-        );
-        first = false;
-    }
-    job
-}
-
-fn is_word_start(bytes: &[u8], i: usize) -> bool {
-    if i >= bytes.len() {
-        return false;
-    }
-    let prev = if i > 0 { bytes[i - 1] } else { b' ' };
-    if (prev as char).is_ascii_alphanumeric() {
-        return false;
-    }
-    (bytes[i] as char).is_ascii_alphabetic()
-}
-
 fn save_results_to_file(state: &TaintState, path: &PathBuf) {
     if let Some(c) = &state.completed {
         if let Err(e) = std::fs::write(path, &c.formatted) {
             eprintln!("failed to save taint results: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use large_text_taint::engine::{TaintEngine, TaintSource, TrackMode};
+    use large_text_taint::parser::TraceParser;
+
+    const TREE_FIXTURE: &str = "\
+libtiny.so!1000 0x7000: \"\tldr\tx1, [x19, #0x10]\" X19=0x1000 => X1=0x1234
+MEM R 0x1010 [8 bytes]: 34 12 00 00 00 00 00 00  4.......
+libtiny.so!1004 0x7004: \"\tadd\tx8, x1, x2\" X1=0x1234, X2=0x1 => X8=0x1235
+libtiny.so!1008 0x7008: \"\tadd\tx8, x8, x10\" X8=0x1235, X10=0x10 => X8=0x1245
+libtiny.so!100c 0x700c: \"\tstr\tx8, [x19, #0x8]\" X8=0x1245, X19=0x1000
+MEM W 0x1008 [8 bytes]: 45 12 00 00 00 00 00 00  E.......
+";
+
+    const EXTERNAL_CALL_FIXTURE: &str = "\
+libtiny.so!2000 0x8000: \"\tblr\tx17\" X17=0x9000
+-> libc.so!strlen(16) ret: 0x10
+libtiny.so!2004 0x8004: \"\tmov\tx11, x10\" X10=0x10 => X11=0x10
+";
+
+    fn child<'a>(node: &'a TaintTreeNode, target: &TaintTarget) -> &'a TaintTreeNode {
+        node.children
+            .iter()
+            .find(|child| child.target == *target)
+            .expect("expected child target to exist")
+    }
+
+    #[test]
+    fn backward_tree_keeps_same_register_at_distinct_steps() {
+        let mut parser = TraceParser::new();
+        parser.load_from_bytes(TREE_FIXTURE.as_bytes());
+        let lines = parser.lines();
+        let start_index = lines
+            .iter()
+            .position(|tl| tl.has_mem_write && tl.mem_write_addr == 0x1008)
+            .expect("store line should exist");
+
+        let mut engine = TaintEngine::new();
+        engine.set_mode(TrackMode::Backward);
+        engine.set_source(TaintSource::from_mem(0x1008));
+        engine.run(lines, start_index);
+
+        let tree = build_taint_tree(
+            engine.results(),
+            &TaintSource::from_mem(0x1008),
+            TrackMode::Backward,
+            start_index,
+            lines,
+            TREE_FIXTURE.as_bytes(),
+        )
+        .expect("tree should be built");
+
+        let x8_after_store = child(&tree, &TaintTarget::Reg(8));
+        assert_eq!(x8_after_store.line_number, 5);
+
+        let x8_continuation = child(x8_after_store, &TaintTarget::Reg(8));
+        let x10_branch = child(x8_after_store, &TaintTarget::Reg(10));
+        assert_eq!(x8_continuation.line_number, 4);
+        assert_eq!(x10_branch.line_number, 4);
+
+        let x1_branch = child(x8_continuation, &TaintTarget::Reg(1));
+        let x2_branch = child(x8_continuation, &TaintTarget::Reg(2));
+        assert_eq!(x1_branch.line_number, 3);
+        assert_eq!(x2_branch.line_number, 3);
+
+        let mem_source = child(x1_branch, &TaintTarget::Mem(MemRange::new(0x1010, 8)));
+        assert_eq!(mem_source.line_number, 1);
+    }
+
+    #[test]
+    fn backward_tree_keeps_external_call_terminal_step_visible() {
+        let mut parser = TraceParser::new();
+        parser.load_from_bytes(EXTERNAL_CALL_FIXTURE.as_bytes());
+        let lines = parser.lines();
+        let start_index = lines
+            .iter()
+            .position(|tl| tl.line_number == 3)
+            .expect("mov line should exist");
+
+        let mut engine = TaintEngine::new();
+        engine.set_mode(TrackMode::Backward);
+        engine.set_source(TaintSource::from_reg(11));
+        engine.run(lines, start_index);
+
+        let tree = build_taint_tree(
+            engine.results(),
+            &TaintSource::from_reg(11),
+            TrackMode::Backward,
+            start_index,
+            lines,
+            EXTERNAL_CALL_FIXTURE.as_bytes(),
+        )
+        .expect("tree should be built");
+
+        let x10_from_mov = child(&tree, &TaintTarget::Reg(10));
+        assert_eq!(x10_from_mov.line_number, 3);
+
+        let x10_terminal = child(x10_from_mov, &TaintTarget::Reg(10));
+        assert_eq!(x10_terminal.line_number, 1);
+        assert!(x10_terminal.raw_line.contains("blr\tx17"));
     }
 }

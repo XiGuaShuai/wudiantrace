@@ -186,9 +186,11 @@ impl LineIndexer {
             }
 
             // Phase 2:全量扫 → 精确 checkpoints + 总行数。
-            if let Some((checkpoints, total_lines)) =
-                sparse_scan_for_exact_index(bytes_all, SPARSE_CHECKPOINT_INTERVAL, &cancel_for_worker)
-            {
+            if let Some((checkpoints, total_lines)) = sparse_scan_for_exact_index(
+                bytes_all,
+                SPARSE_CHECKPOINT_INTERVAL,
+                &cancel_for_worker,
+            ) {
                 // 接收端被 drop(换文件 / 退出 app)时 send 会 Err,
                 // 无声忽略即可 —— 对端不再关心结果。
                 let _ = tx.send(IndexMsg::Exact {
@@ -572,7 +574,10 @@ mod tests {
         expected_offsets.pop();
         let path = file.path().to_path_buf();
         let reader = FileReader::new(path, detect_encoding(b""))?;
-        assert!(reader.len() > 10_000_000, "test file should hit sparse path");
+        assert!(
+            reader.len() > 10_000_000,
+            "test file should hit sparse path"
+        );
 
         let mut indexer = LineIndexer::new();
         indexer.index_file(&reader);
@@ -585,11 +590,7 @@ mod tests {
             let (start, end) = indexer
                 .get_line_with_reader(line, &reader)
                 .expect("line should resolve");
-            assert_eq!(
-                start, expected_offsets[line],
-                "line {} start offset",
-                line
-            );
+            assert_eq!(start, expected_offsets[line], "line {} start offset", line);
             assert!(end >= start);
             assert_eq!(
                 indexer.find_line_at_offset(start, &reader),

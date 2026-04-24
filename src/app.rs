@@ -613,7 +613,12 @@ impl TextViewerApp {
         let encoding = reader.encoding();
 
         if let Some(output_path) = rfd::FileDialog::new()
-            .set_file_name(input_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())
+            .set_file_name(
+                input_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default(),
+            )
             .save_file()
         {
             // If saving to the same file
@@ -716,7 +721,10 @@ impl TextViewerApp {
         if let Some(output_path) = rfd::FileDialog::new()
             .set_file_name(format!(
                 "{}.modified",
-                input_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                input_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
             ))
             .save_file()
         {
@@ -987,10 +995,7 @@ impl TextViewerApp {
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(
-                            self.file_reader.is_some(),
-                            egui::Button::new("污点追踪..."),
-                        )
+                        .add_enabled(self.file_reader.is_some(), egui::Button::new("污点追踪..."))
                         .on_hover_text("对当前 trace 运行 ARM64 xgtrace 污点传播分析")
                         .clicked()
                     {
@@ -1238,12 +1243,9 @@ impl TextViewerApp {
                         if !search_focused {
                             if let Some(other) = any_focused_id {
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "(焦点在 {:?})  ",
-                                        other
-                                    ))
-                                    .size(10.0)
-                                    .color(egui::Color32::from_rgb(180, 180, 100)),
+                                    egui::RichText::new(format!("(焦点在 {:?})  ", other))
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(180, 180, 100)),
                                 );
                             }
                         }
@@ -1827,9 +1829,7 @@ impl TextViewerApp {
             self.search_line_cache.clear();
             self.search_line_cache.reserve(rows_count);
         }
-        if page_or_query_changed
-            || self.search_preview_cache.len() < rows_count
-        {
+        if page_or_query_changed || self.search_preview_cache.len() < rows_count {
             // Same cache-build pass for both preview strings and line
             // numbers. Keep them side-by-side so the check at the top of
             // the frame covers both — otherwise each visible row would
@@ -1842,7 +1842,10 @@ impl TextViewerApp {
                 if let std::collections::hash_map::Entry::Vacant(e) =
                     self.search_line_cache.entry(r.byte_offset)
                 {
-                    e.insert(self.line_indexer.find_line_at_offset(r.byte_offset, &reader));
+                    e.insert(
+                        self.line_indexer
+                            .find_line_at_offset(r.byte_offset, &reader),
+                    );
                 }
             }
             self.search_preview_cache_key =
@@ -1870,15 +1873,13 @@ impl TextViewerApp {
                 );
                 let mut dock_btn = |ui: &mut egui::Ui, label: &str, side: DockSide, tip: &str| {
                     let selected = dock_side == side;
-                    let btn = egui::Button::new(
-                        egui::RichText::new(label)
-                            .size(14.0)
-                            .color(if selected {
-                                egui::Color32::BLACK
-                            } else {
-                                egui::Color32::from_rgb(210, 210, 210)
-                            }),
-                    )
+                    let btn = egui::Button::new(egui::RichText::new(label).size(14.0).color(
+                        if selected {
+                            egui::Color32::BLACK
+                        } else {
+                            egui::Color32::from_rgb(210, 210, 210)
+                        },
+                    ))
                     .fill(if selected {
                         egui::Color32::from_rgb(255, 210, 100)
                     } else {
@@ -1902,167 +1903,164 @@ impl TextViewerApp {
                 }
             });
             ui.separator();
-                if total == 0 {
-                    ui.label(
-                        egui::RichText::new("暂无搜索结果,先按 Ctrl+F 搜索一下")
-                            .color(egui::Color32::from_rgb(150, 150, 150))
-                            .italics(),
-                    );
-                    return;
-                }
+            if total == 0 {
+                ui.label(
+                    egui::RichText::new("暂无搜索结果,先按 Ctrl+F 搜索一下")
+                        .color(egui::Color32::from_rgb(150, 150, 150))
+                        .italics(),
+                );
+                return;
+            }
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "当前页 {} 条 · 全局共 {} 条",
-                            rows_count, total
-                        ))
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("当前页 {} 条 · 全局共 {} 条", rows_count, total))
                         .size(12.0)
                         .color(egui::Color32::from_rgb(200, 200, 200)),
-                    );
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "显示全局索引 [{}..{})",
-                            page_start,
-                            page_start + rows_count
-                        ))
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(150, 150, 150)),
-                    );
-                });
-                ui.add_space(4.0);
+                );
+                ui.separator();
                 ui.label(
-                    egui::RichText::new(
-                        "提示:双击一行跳转。翻页用搜索工具栏的 ← / → 按钮(每页 1000 条)",
-                    )
+                    egui::RichText::new(format!(
+                        "显示全局索引 [{}..{})",
+                        page_start,
+                        page_start + rows_count
+                    ))
                     .size(11.0)
                     .color(egui::Color32::from_rgb(150, 150, 150)),
                 );
-                ui.separator();
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "提示:双击一行跳转。翻页用搜索工具栏的 ← / → 按钮(每页 1000 条)",
+                )
+                .size(11.0)
+                .color(egui::Color32::from_rgb(150, 150, 150)),
+            );
+            ui.separator();
 
-                let text_h = ui.text_style_height(&egui::TextStyle::Monospace);
-                let row_h = text_h + 6.0;
+            let text_h = ui.text_style_height(&egui::TextStyle::Monospace);
+            let row_h = text_h + 6.0;
 
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    // Give rows (not individual labels) click sense so
-                    // TextEdit focus elsewhere isn't stolen by cell labels.
-                    .sense(egui::Sense::click())
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::initial(60.0).at_least(40.0))
-                    .column(Column::initial(90.0).at_least(60.0))
-                    .column(Column::initial(130.0).at_least(80.0))
-                    .column(Column::remainder().at_least(200.0))
-                    .header(22.0, |mut header| {
-                        let hfmt = |s: &str| {
-                            egui::RichText::new(s)
-                                .size(12.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(210, 210, 210))
-                        };
-                        header.col(|ui| {
-                            ui.label(hfmt("#"));
-                        });
-                        header.col(|ui| {
-                            ui.label(hfmt("行号"));
-                        });
-                        header.col(|ui| {
-                            ui.label(hfmt("字节偏移"));
-                        });
-                        header.col(|ui| {
-                            ui.label(hfmt("预览"));
-                        });
-                    })
-                    .body(|body| {
-                        body.rows(row_h, rows_count, |mut row| {
-                            let local_i = row.index();
-                            let result = &self.search_results[local_i];
-                            let global_idx = page_start + local_i;
-                            let is_current = global_idx == current_global;
-                            row.set_selected(is_current);
-
-                            // O(1) cached lookup — the per-page cache above
-                            // populated this entry during the frame's build
-                            // pass. Avoids sparse-index scans per row.
-                            let viewer_line = self
-                                .search_line_cache
-                                .get(&result.byte_offset)
-                                .copied()
-                                .unwrap_or(0);
-
-                            // O(1) cached lookup (built once per page above).
-                            let preview = self
-                                .search_preview_cache
-                                .get(&result.byte_offset)
-                                .cloned()
-                                .unwrap_or_default();
-
-                            let idx_color = if is_current {
-                                egui::Color32::from_rgb(255, 210, 100)
-                            } else {
-                                egui::Color32::from_rgb(180, 180, 180)
-                            };
-                            let line_color = egui::Color32::from_rgb(255, 210, 120);
-                            let off_color = egui::Color32::from_rgb(160, 200, 240);
-                            let prev_color = egui::Color32::from_rgb(225, 225, 225);
-
-                            // Cells are plain labels with no Sense — the row's
-                            // interact rect (enabled by .sense(click) on
-                            // TableBuilder) is what captures click events.
-                            row.col(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!("{}", global_idx + 1))
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(idx_color),
-                                    )
-                                    .selectable(false),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!("{}", viewer_line + 1))
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(line_color),
-                                    )
-                                    .selectable(false),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!("0x{:x}", result.byte_offset))
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(off_color),
-                                    )
-                                    .selectable(false),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&preview)
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(prev_color),
-                                    )
-                                    .selectable(false)
-                                    .truncate(),
-                                );
-                            });
-
-                            let row_resp = row.response().on_hover_text(&preview);
-                            if row_resp.double_clicked() {
-                                jump_global_idx = Some(global_idx);
-                            }
-                        });
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                // Give rows (not individual labels) click sense so
+                // TextEdit focus elsewhere isn't stolen by cell labels.
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::initial(60.0).at_least(40.0))
+                .column(Column::initial(90.0).at_least(60.0))
+                .column(Column::initial(130.0).at_least(80.0))
+                .column(Column::remainder().at_least(200.0))
+                .header(22.0, |mut header| {
+                    let hfmt = |s: &str| {
+                        egui::RichText::new(s)
+                            .size(12.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(210, 210, 210))
+                    };
+                    header.col(|ui| {
+                        ui.label(hfmt("#"));
                     });
+                    header.col(|ui| {
+                        ui.label(hfmt("行号"));
+                    });
+                    header.col(|ui| {
+                        ui.label(hfmt("字节偏移"));
+                    });
+                    header.col(|ui| {
+                        ui.label(hfmt("预览"));
+                    });
+                })
+                .body(|body| {
+                    body.rows(row_h, rows_count, |mut row| {
+                        let local_i = row.index();
+                        let result = &self.search_results[local_i];
+                        let global_idx = page_start + local_i;
+                        let is_current = global_idx == current_global;
+                        row.set_selected(is_current);
+
+                        // O(1) cached lookup — the per-page cache above
+                        // populated this entry during the frame's build
+                        // pass. Avoids sparse-index scans per row.
+                        let viewer_line = self
+                            .search_line_cache
+                            .get(&result.byte_offset)
+                            .copied()
+                            .unwrap_or(0);
+
+                        // O(1) cached lookup (built once per page above).
+                        let preview = self
+                            .search_preview_cache
+                            .get(&result.byte_offset)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let idx_color = if is_current {
+                            egui::Color32::from_rgb(255, 210, 100)
+                        } else {
+                            egui::Color32::from_rgb(180, 180, 180)
+                        };
+                        let line_color = egui::Color32::from_rgb(255, 210, 120);
+                        let off_color = egui::Color32::from_rgb(160, 200, 240);
+                        let prev_color = egui::Color32::from_rgb(225, 225, 225);
+
+                        // Cells are plain labels with no Sense — the row's
+                        // interact rect (enabled by .sense(click) on
+                        // TableBuilder) is what captures click events.
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}", global_idx + 1))
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(idx_color),
+                                )
+                                .selectable(false),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}", viewer_line + 1))
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(line_color),
+                                )
+                                .selectable(false),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("0x{:x}", result.byte_offset))
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(off_color),
+                                )
+                                .selectable(false),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&preview)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(prev_color),
+                                )
+                                .selectable(false)
+                                .truncate(),
+                            );
+                        });
+
+                        let row_resp = row.response().on_hover_text(&preview);
+                        if row_resp.double_clicked() {
+                            jump_global_idx = Some(global_idx);
+                        }
+                    });
+                });
         };
 
         // 内层 `ScrollArea` 是面板宽度稳定的关键,不是样式。

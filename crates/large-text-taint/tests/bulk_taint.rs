@@ -96,9 +96,9 @@ fn validate_results(
     for (i, entry) in results.iter().enumerate() {
         let reg_count: usize = entry.reg_snapshot.iter().filter(|&&b| b).count();
         // mem_snapshot 也不应该包含 0 地址
-        for &addr in &entry.mem_snapshot {
+        for range in &entry.mem_snapshot {
             assert!(
-                addr != 0,
+                range.addr != 0,
                 "{label}: result[{i}] has mem_snapshot containing address 0"
             );
         }
@@ -119,11 +119,7 @@ fn validate_results(
 }
 
 /// 对一个采样点内的某条指令跑 Backward + Forward + 内存追踪。
-fn test_instruction(
-    _bytes: &[u8],
-    lines: &[large_text_taint::trace::TraceLine],
-    insn_idx: usize,
-) {
+fn test_instruction(_bytes: &[u8], lines: &[large_text_taint::trace::TraceLine], insn_idx: usize) {
     let tl = &lines[insn_idx];
     let line_num = tl.line_number;
 

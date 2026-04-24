@@ -43,10 +43,10 @@ fn tune_scroll_speed(ctx: &egui::Context) {
 fn install_cjk_fonts(ctx: &egui::Context) {
     const CANDIDATES: &[&str] = &[
         // Windows
-        r"C:\Windows\Fonts\msyh.ttc",     // Microsoft YaHei
-        r"C:\Windows\Fonts\msyhbd.ttc",   // Microsoft YaHei Bold
-        r"C:\Windows\Fonts\simhei.ttf",   // SimHei
-        r"C:\Windows\Fonts\simsun.ttc",   // SimSun
+        r"C:\Windows\Fonts\msyh.ttc",   // Microsoft YaHei
+        r"C:\Windows\Fonts\msyhbd.ttc", // Microsoft YaHei Bold
+        r"C:\Windows\Fonts\simhei.ttf", // SimHei
+        r"C:\Windows\Fonts\simsun.ttc", // SimSun
         // macOS
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -55,10 +55,7 @@ fn install_cjk_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ];
 
-    let Some(bytes) = CANDIDATES
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-    else {
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
         eprintln!("[fonts] no CJK font found; Chinese UI will show as tofu");
         return;
     };

@@ -94,8 +94,19 @@ fn parse_mem_value(buf: &[u8]) -> u64 {
     val
 }
 
-/// Standalone `MEM R/W 0x<addr> [N bytes]: ...` line. Returns (rw, addr, value).
-fn parse_mem_line(buf: &[u8]) -> Option<(u8, u64, u64)> {
+fn parse_decimal_safe(s: &[u8]) -> u64 {
+    let mut val = 0u64;
+    for &c in s {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        val = val.saturating_mul(10).saturating_add((c - b'0') as u64);
+    }
+    val
+}
+
+/// Standalone `MEM R/W 0x<addr> [N bytes]: ...` line. Returns (rw, addr, value, size).
+fn parse_mem_line(buf: &[u8]) -> Option<(u8, u64, u64, u8)> {
     if buf.len() < 6 {
         return None;
     }
@@ -127,8 +138,23 @@ fn parse_mem_line(buf: &[u8]) -> Option<(u8, u64, u64)> {
         return None;
     }
     let addr = parse_hex_safe(&buf[hex_start..k]);
+    let mut size = 8u8;
+    if k < buf.len() && buf[k] == b' ' {
+        k += 1;
+    }
+    if k < buf.len() && buf[k] == b'[' {
+        k += 1;
+        let size_start = k;
+        while k < buf.len() && buf[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k > size_start {
+            let parsed = parse_decimal_safe(&buf[size_start..k]);
+            size = parsed.clamp(1, u8::MAX as u64) as u8;
+        }
+    }
     let val = parse_mem_value(buf);
-    Some((rw, addr, val))
+    Some((rw, addr, val, size))
 }
 
 /// Extract a leading alphanumeric token (matches C++ extract_token).
@@ -259,12 +285,13 @@ impl TraceParser {
             }
 
             if let Some(idx) = pending_idx {
-                if let Some((rw, addr, val)) = parse_mem_line(line) {
+                if let Some((rw, addr, val, size)) = parse_mem_line(line) {
                     attach_mem(
                         &mut self.lines[idx],
                         rw,
                         addr,
                         val,
+                        size,
                         &mut pending_reads,
                         &mut pending_writes,
                     );
@@ -514,8 +541,18 @@ impl TraceParser {
             let toks = &tok[..n];
             if matches!(
                 toks,
-                b"lsl" | b"lsr" | b"asr" | b"ror" | b"sxtb" | b"sxth" | b"sxtw" | b"sxtx"
-                    | b"uxtb" | b"uxth" | b"uxtw" | b"uxtx"
+                b"lsl"
+                    | b"lsr"
+                    | b"asr"
+                    | b"ror"
+                    | b"sxtb"
+                    | b"sxth"
+                    | b"sxtw"
+                    | b"sxtx"
+                    | b"uxtb"
+                    | b"uxth"
+                    | b"uxtw"
+                    | b"uxtx"
             ) {
                 continue;
             }
@@ -581,7 +618,128 @@ impl TraceParser {
     pub fn find_by_rel_addr(&self, rel_addr: u64) -> Option<usize> {
         self.lines.iter().position(|l| l.rel_addr == rel_addr)
     }
+}
 
+/// Information extracted from a MEM R/W line's hexdump.
+pub struct MemHexInfo {
+    pub addr: u64,
+    pub hexdump: Vec<u8>, // e.g. b"f7 78 16 2b 6b bc 43 62"
+}
+
+/// For a Load instruction's `TraceLine`, read the following MEM R line from raw
+/// bytes and return the hexdump text + address.  When `second` is true, return
+/// the **second** MEM R line (used for the second register of LDP).
+pub fn extract_mem_read_hexdump(bytes: &[u8], tl: &TraceLine, second: bool) -> Option<MemHexInfo> {
+    let mut pos = tl.file_offset as usize + tl.line_len as usize;
+    // skip past line ending (\r\n or \n)
+    while pos < bytes.len() && (bytes[pos] == b'\r' || bytes[pos] == b'\n') {
+        pos += 1;
+    }
+
+    let target = if second { 2u8 } else { 1u8 };
+    let mut seen = 0u8;
+
+    loop {
+        if pos >= bytes.len() {
+            return None;
+        }
+        let line_end = memchr(b'\n', &bytes[pos..])
+            .map(|p| pos + p)
+            .unwrap_or(bytes.len());
+        let mut end = line_end;
+        if end > pos && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let line = &bytes[pos..end];
+
+        if line.starts_with(b"MEM R ") {
+            seen += 1;
+            if seen == target {
+                let (_, addr, _, _) = parse_mem_line(line)?;
+                let hexdump = extract_hexdump_text(line)?;
+                return Some(MemHexInfo { addr, hexdump });
+            }
+        } else if !line.starts_with(b"MEM ") {
+            return None;
+        }
+        pos = if line_end < bytes.len() {
+            line_end + 1
+        } else {
+            bytes.len()
+        };
+    }
+}
+
+/// Extract the hex-byte portion from a MEM line.
+///
+/// `MEM R 0x77ac231028 [8 bytes]: f7 78 16 2b 6b bc 43 62  .x.+k.Cb`
+///                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+fn extract_hexdump_text(mem_line: &[u8]) -> Option<Vec<u8>> {
+    let marker = memmem::find(mem_line, b"]: ")?;
+    let start = marker + 3;
+    let mut end = start;
+    while end < mem_line.len() {
+        let c = mem_line[end];
+        if c == b' ' {
+            // double-space = end of hex, start of ASCII dump
+            if end + 1 < mem_line.len() && mem_line[end + 1] == b' ' {
+                break;
+            }
+            end += 1;
+        } else if c.is_ascii_hexdigit() {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    while end > start && mem_line[end - 1] == b' ' {
+        end -= 1;
+    }
+    if end > start {
+        Some(mem_line[start..end].to_vec())
+    } else {
+        None
+    }
+}
+
+/// Search raw trace bytes for the **earliest** `MEM W` line whose hexdump
+/// matches `hexdump` AND whose address equals `addr`.
+///
+/// Returns the byte offset of the start of that MEM W line.
+pub fn search_earliest_mem_write(bytes: &[u8], hexdump: &[u8], addr: u64) -> Option<u64> {
+    if hexdump.is_empty() {
+        return None;
+    }
+    let finder = memmem::Finder::new(hexdump);
+    let mut search_pos = 0usize;
+
+    while let Some(rel) = finder.find(&bytes[search_pos..]) {
+        let abs = search_pos + rel;
+        // find start of this line
+        let line_start = match memchr::memrchr(b'\n', &bytes[..abs]) {
+            Some(p) => p + 1,
+            None => 0,
+        };
+        // find end of this line
+        let line_end = memchr(b'\n', &bytes[abs..])
+            .map(|p| abs + p)
+            .unwrap_or(bytes.len());
+        let mut end = line_end;
+        if end > line_start && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let line = &bytes[line_start..end];
+
+        if line.starts_with(b"MEM W ") {
+            if let Some((b'W', parsed_addr, _, size)) = parse_mem_line(line) {
+                if addr >= parsed_addr && addr < parsed_addr.saturating_add(size as u64) {
+                    return Some(line_start as u64);
+                }
+            }
+        }
+        search_pos = abs + 1;
+    }
+    None
 }
 
 /// Read the original raw text of an instruction line out of a backing byte
@@ -623,10 +781,7 @@ fn extract_mem_regs(segment: &[u8], out: &mut TraceLine) {
 /// Returns 0 when not a pair instruction.
 fn pair_reg_size_for(mnem: &[u8], ops: &[u8]) -> u8 {
     let is_stp = matches!(mnem, b"stp" | b"stxp" | b"stlxp" | b"stnp");
-    let is_ldp = matches!(
-        mnem,
-        b"ldp" | b"ldpsw" | b"ldxp" | b"ldaxp" | b"ldnp"
-    );
+    let is_ldp = matches!(mnem, b"ldp" | b"ldpsw" | b"ldxp" | b"ldaxp" | b"ldnp");
     if !(is_stp || is_ldp) {
         return 0;
     }
@@ -656,28 +811,40 @@ fn apply_pair_inference(tl: &mut TraceLine) {
             if tl.has_mem_write && !tl.has_mem_write2 {
                 tl.has_mem_write2 = true;
                 tl.mem_write_addr2 = tl.mem_write_addr.wrapping_add(size);
+                tl.mem_write_size2 = tl.mem_write_size.max(tl.pair_reg_size);
             }
         }
         InsnCategory::Load => {
             if tl.has_mem_read && !tl.has_mem_read2 {
                 tl.has_mem_read2 = true;
                 tl.mem_read_addr2 = tl.mem_read_addr.wrapping_add(size);
+                tl.mem_read_size2 = tl.mem_read_size.max(tl.pair_reg_size);
             }
         }
         _ => {}
     }
 }
 
-fn attach_mem(tl: &mut TraceLine, rw: u8, addr: u64, val: u64, reads: &mut u8, writes: &mut u8) {
+fn attach_mem(
+    tl: &mut TraceLine,
+    rw: u8,
+    addr: u64,
+    val: u64,
+    size: u8,
+    reads: &mut u8,
+    writes: &mut u8,
+) {
     if rw == b'R' {
         if *reads == 0 {
             tl.has_mem_read = true;
             tl.mem_read_addr = addr;
             tl.mem_read_val = val;
+            tl.mem_read_size = size;
         } else if *reads == 1 {
             tl.has_mem_read2 = true;
             tl.mem_read_addr2 = addr;
             tl.mem_read_val2 = val;
+            tl.mem_read_size2 = size;
         }
         *reads += 1;
     } else if rw == b'W' {
@@ -685,10 +852,12 @@ fn attach_mem(tl: &mut TraceLine, rw: u8, addr: u64, val: u64, reads: &mut u8, w
             tl.has_mem_write = true;
             tl.mem_write_addr = addr;
             tl.mem_write_val = val;
+            tl.mem_write_size = size;
         } else if *writes == 1 {
             tl.has_mem_write2 = true;
             tl.mem_write_addr2 = addr;
             tl.mem_write_val2 = val;
+            tl.mem_write_size2 = size;
         }
         *writes += 1;
     }

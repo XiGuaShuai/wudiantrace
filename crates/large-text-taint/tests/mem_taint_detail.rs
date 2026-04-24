@@ -17,13 +17,13 @@ fn open_trace() -> Option<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(&file).ok() }
 }
 
-fn print_results(
-    engine: &TaintEngine,
-    lines: &[large_text_taint::trace::TraceLine],
-    bytes: &[u8],
-) {
+fn print_results(engine: &TaintEngine, lines: &[large_text_taint::trace::TraceLine], bytes: &[u8]) {
     let results = engine.results();
-    println!("  命中 {} 条, stop={:?}", results.len(), engine.stop_reason());
+    println!(
+        "  命中 {} 条, stop={:?}",
+        results.len(),
+        engine.stop_reason()
+    );
     for (i, entry) in results.iter().enumerate() {
         let tl = &lines[entry.index];
         let raw = read_raw_line(bytes, tl).trim_end().to_string();
@@ -37,7 +37,13 @@ fn print_results(
         let mut mems: Vec<String> = entry
             .mem_snapshot
             .iter()
-            .map(|a| format!("mem:0x{:x}", a))
+            .map(|range| {
+                if range.size <= 1 {
+                    format!("mem:0x{:x}", range.addr)
+                } else {
+                    format!("mem:0x{:x}..0x{:x}", range.addr, range.end() - 1)
+                }
+            })
             .collect();
         mems.sort();
         let tainted = if regs.is_empty() && mems.is_empty() {
@@ -79,7 +85,10 @@ fn mem_taint_detail_first_200_lines() {
     if let Some(idx) = lines.iter().position(|tl| tl.line_number == 32) {
         let tl = &lines[idx];
         assert!(tl.has_mem_read, "line 32 should have mem_read");
-        println!("  起点: line {} addr=0x{:x}", tl.line_number, tl.mem_read_addr);
+        println!(
+            "  起点: line {} addr=0x{:x}",
+            tl.line_number, tl.mem_read_addr
+        );
 
         let mut engine = TaintEngine::new();
         engine.set_mode(TrackMode::Forward);
@@ -100,7 +109,10 @@ fn mem_taint_detail_first_200_lines() {
     if let Some(idx) = lines.iter().position(|tl| tl.line_number == 47) {
         let tl = &lines[idx];
         assert!(tl.has_mem_write, "line 47 should have mem_write");
-        println!("  起点: line {} addr=0x{:x}", tl.line_number, tl.mem_write_addr);
+        println!(
+            "  起点: line {} addr=0x{:x}",
+            tl.line_number, tl.mem_write_addr
+        );
 
         let mut engine = TaintEngine::new();
         engine.set_mode(TrackMode::Backward);
@@ -134,7 +146,9 @@ fn mem_taint_detail_first_200_lines() {
     //   MEM W 0x77ac222758 ← x3, MEM W 0x77ac222760 ← x0
     //   正向追踪第一个写入地址:看 x3 存到内存后谁读了它
     // ========================================================
-    println!("\n===== 案例 4: Forward mem:0x77ac222758 from line 24 (stp x3, x0, [x19, #0xb8]) =====");
+    println!(
+        "\n===== 案例 4: Forward mem:0x77ac222758 from line 24 (stp x3, x0, [x19, #0xb8]) ====="
+    );
     if let Some(idx) = lines.iter().position(|tl| tl.line_number == 24) {
         let tl = &lines[idx];
         assert!(tl.has_mem_write, "line 24 should have mem_write");
@@ -166,12 +180,17 @@ fn mem_taint_detail_first_200_lines() {
     println!("  50% 位置解析出 {} 条指令", mid_lines.len());
 
     // 找第一个有 mem_read 的指令
-    if let Some(idx) = mid_lines.iter().position(|tl| tl.has_mem_read && tl.mem_read_addr != 0) {
+    if let Some(idx) = mid_lines
+        .iter()
+        .position(|tl| tl.has_mem_read && tl.mem_read_addr != 0)
+    {
         let tl = &mid_lines[idx];
         let raw = read_raw_line(window, tl).trim_end().to_string();
         println!(
             "  选中: [line {}] {} (mem_read=0x{:x})",
-            tl.line_number, &raw[..raw.len().min(80)], tl.mem_read_addr
+            tl.line_number,
+            &raw[..raw.len().min(80)],
+            tl.mem_read_addr
         );
 
         let mut engine = TaintEngine::new();
@@ -194,12 +213,17 @@ fn mem_taint_detail_first_200_lines() {
     let l80 = p80.lines();
     println!("  80% 位置解析出 {} 条指令", l80.len());
 
-    if let Some(idx) = l80.iter().position(|tl| tl.has_mem_write && tl.mem_write_addr != 0) {
+    if let Some(idx) = l80
+        .iter()
+        .position(|tl| tl.has_mem_write && tl.mem_write_addr != 0)
+    {
         let tl = &l80[idx];
         let raw = read_raw_line(win80, tl).trim_end().to_string();
         println!(
             "  选中: [line {}] {} (mem_write=0x{:x})",
-            tl.line_number, &raw[..raw.len().min(80)], tl.mem_write_addr
+            tl.line_number,
+            &raw[..raw.len().min(80)],
+            tl.mem_write_addr
         );
 
         let mut engine = TaintEngine::new();

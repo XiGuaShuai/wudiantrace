@@ -72,20 +72,23 @@ pub fn parse_reg_name(s: &[u8]) -> RegId {
     match s[0] {
         b'x' | b'X' => parse_x_or_w(s),
         b'w' | b'W' => parse_x_or_w(s),
-        b's' => {
-            if s.len() == 2 && s[1] == b'p' {
+        b's' | b'S' => {
+            if s.eq_ignore_ascii_case(b"sp") {
                 return REG_SP;
             }
             parse_indexed(s, REG_S0, 31)
         }
-        b'f' => {
-            if s.len() == 2 && s[1] == b'p' {
+        b'f' | b'F' => {
+            if s.eq_ignore_ascii_case(b"fp") {
                 return REG_FP;
+            }
+            if s.eq_ignore_ascii_case(b"flags") {
+                return REG_NZCV;
             }
             REG_INVALID
         }
-        b'l' => {
-            if s.len() == 2 && s[1] == b'r' {
+        b'l' | b'L' => {
+            if s.eq_ignore_ascii_case(b"lr") {
                 return REG_LR;
             }
             REG_INVALID
@@ -94,8 +97,8 @@ pub fn parse_reg_name(s: &[u8]) -> RegId {
         b'd' | b'D' => parse_indexed(s, REG_D0, 31),
         // h/b/v alias to q-series (vector regs of various widths).
         b'h' | b'H' | b'b' | b'B' | b'v' | b'V' => parse_indexed(s, REG_Q0, 31),
-        b'n' => {
-            if s == b"nzcv" {
+        b'n' | b'N' => {
+            if s.eq_ignore_ascii_case(b"nzcv") {
                 return REG_NZCV;
             }
             REG_INVALID
@@ -111,7 +114,11 @@ fn parse_x_or_w(s: &[u8]) -> RegId {
         return REG_X0 + (s[1] - b'0');
     }
     // x10..x30 / w10..w30
-    if s.len() == 3 && (b'0'..=b'3').contains(&s[1]) && s[1].is_ascii_digit() && s[2].is_ascii_digit() {
+    if s.len() == 3
+        && (b'0'..=b'3').contains(&s[1])
+        && s[1].is_ascii_digit()
+        && s[2].is_ascii_digit()
+    {
         let n = (s[1] - b'0') * 10 + (s[2] - b'0');
         if n <= 30 {
             return REG_X0 + n;
